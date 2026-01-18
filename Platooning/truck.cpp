@@ -24,7 +24,7 @@ const double GAP_TOLERANCE = 1.0;
 
 // --- Global State ---
 struct TruckState {
-    int id;
+    int id{};
     int targetPlatoonSize = 1;
     double speed = 0.0;
     double position = 0.0;
@@ -47,30 +47,29 @@ struct TruckRank {
 // THREAD 1: COMMUNICATION (With Failure Sim)
 // ==========================================
 void* commsLoop(void* arg) {
-    NetworkModule* net = (NetworkModule*)arg;
+    auto* net = (NetworkModule*)arg;
     while (true) {
         while (true) {
-            PlatoonMessage msg;
+            PlatoonMessage msg{};
             if (!net->receive(msg)) break;
             pthread_mutex_lock(&stateMutex);
             state.neighbors[msg.truckId] = msg;
-            state.neighbors[msg.truckId].timestamp = time(NULL);
+            state.neighbors[msg.truckId].timestamp = time(nullptr); // NOLINT(*-narrowing-conversions)
             pthread_mutex_unlock(&stateMutex);
         }
 
-        // --- NEW: ONLY BROADCAST IF RADIO IS WORKING ---
         bool currentlyJamming = false;
 
-        PlatoonMessage myMsg;
+        PlatoonMessage myMsg{};
         pthread_mutex_lock(&stateMutex);
-        currentlyJamming = state.isJamming; // Check status
+        currentlyJamming = state.isJamming;
 
         myMsg.truckId = state.id;
         myMsg.position = state.position;
         myMsg.speed = state.speed;
         myMsg.emergencyBrake = state.emergencyBrake;
         myMsg.isDecoupled = state.isDecoupled;
-        myMsg.timestamp = time(NULL);
+        myMsg.timestamp = time(nullptr); // NOLINT(*-narrowing-conversions)
         pthread_mutex_unlock(&stateMutex);
 
         if (!currentlyJamming) {
@@ -81,7 +80,7 @@ void* commsLoop(void* arg) {
 
         usleep(50000);
     }
-    return NULL;
+    return nullptr;
 }
 
 // ==========================================
@@ -120,7 +119,7 @@ void* inputLoop(void* arg) {
             default: break;
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 // ==========================================
@@ -131,7 +130,7 @@ void logicLoop() {
 
     while (true) {
         pthread_mutex_lock(&stateMutex);
-        long now = time(NULL);
+        long now = time(nullptr); // NOLINT(*-narrowing-conversions)
 
         // 1. CLEANUP (The robust part: Remove trucks that stop talking)
         for (auto it = state.neighbors.begin(); it != state.neighbors.end(); ) {
@@ -305,16 +304,16 @@ int main() {
 
     state.position = -(state.id * TARGET_DISTANCE);
 
-    if (pthread_mutex_init(&stateMutex, NULL) != 0) return 1;
+    if (pthread_mutex_init(&stateMutex, nullptr) != 0) return 1;
 
     NetworkModule net(state.id);
     net.flush();
 
     pthread_t commsThreadId;
-    pthread_create(&commsThreadId, NULL, commsLoop, (void*)&net);
+    pthread_create(&commsThreadId, nullptr, commsLoop, (void*)&net);
 
     pthread_t inputThreadId;
-    pthread_create(&inputThreadId, NULL, inputLoop, NULL);
+    pthread_create(&inputThreadId, nullptr, inputLoop, nullptr);
 
     logicLoop();
     return 0;
