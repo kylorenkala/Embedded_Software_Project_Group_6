@@ -20,10 +20,20 @@ trucks = {}
 
 def parse_packet(data):
     try:
+        # Old format: i 4x d d ? 3x l
+        # New format: i 4x d d ? ? 2x l  (Two bools: Brake, Decoupled)
+        
+        # Check for the new larger packet size (approx 33-40 bytes depending on packing)
         if len(data) >= 32:
-             return struct.unpack('i 4x d d ? 3x l', data[0:32]) 
-        elif len(data) >= 29:
-             return struct.unpack('i d d ? l', data[0:29])
+             # Try unpacking with 2 bools
+             try:
+                 # i=4, d=8, d=8, ?=1, ?=1, pad=2, l=8 => Total 32 bytes
+                 # We simply add another '?' for the decoupled flag
+                 unpacked = struct.unpack('i 4x d d ? ? 2x l', data[0:32])
+                 return unpacked[0], unpacked[1], unpacked[2], unpacked[3], unpacked[5] # Return ID, Pos, Spd, Brake, Time
+             except:
+                 # Fallback to old format if something goes wrong
+                 return struct.unpack('i 4x d d ? 3x l', data[0:32])
     except:
         return None
     return None
