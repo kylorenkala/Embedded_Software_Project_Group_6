@@ -143,6 +143,21 @@ void logicLoop() {
             }
         }
 
+		if (state.isJamming) {
+             state.speed -= MAX_BRAKE * dt;
+             if (state.speed < 0) state.speed = 0.0;
+
+             // Skip the rest of the logic (Cruise/Follow)
+             state.position += state.speed * dt;
+
+             // Log the emergency
+             if (state.id != 0) std::cout << "[T" << state.id << "] (RADIO FAILURE) EMERGENCY STOPPING! Spd: " << (state.speed*3.6) << "\n";
+
+             pthread_mutex_unlock(&stateMutex);
+             usleep(100000);
+             continue; // Loop again
+        }
+
         switch (state.id) {
             case 0: { // LEADER
                 int currentSize = 1;
@@ -240,10 +255,36 @@ void logicLoop() {
 
         state.position += state.speed * dt;
 
+        // ... (inside logicLoop, after position update) ...
+
+        // Logging
         if (state.id != 0) {
              std::cout << "[T" << state.id << "] ";
              if (state.isJamming) std::cout << "(NO SIGNAL) ";
-             std::cout << "Spd: " << (state.speed * 3.6) << " km/h\n";
+
+             // Print Speed
+             std::cout << "Speed: " << std::fixed << std::setprecision(1) << (state.speed * 3.6) << " km/h";
+
+             // Check gap to the truck physically ahead
+             int aheadId = -1;
+             double minDiff = 99999.0;
+             for (auto const& [nid, msg] : state.neighbors) {
+                 double diff = msg.position - state.position;
+                 if (diff > 0 && diff < minDiff) {
+                     minDiff = diff;
+                     aheadId = nid;
+                 }
+             }
+
+             // Print Gap in the requested format: "| Behind T1: 135.9m"
+             if(aheadId != -1) {
+                 std::cout << " | Behind T" << aheadId << ": " << std::fixed << std::setprecision(1) << minDiff << "m";
+             }
+             std::cout << "\n";
+        }
+        else if (state.id == 0) {
+            // Optional: Leader logging to keep track of it
+            std::cout << "[LEADER] Speed: " << std::fixed << std::setprecision(1) << (state.speed * 3.6) << " km/h\n";
         }
 
         pthread_mutex_unlock(&stateMutex);
