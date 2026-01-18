@@ -17,7 +17,7 @@ const double MAX_SPEED = 100.0 * KMH_TO_MS;
 const double MAX_ACCEL = 3.0;
 const double MAX_BRAKE = 5.0;
 const double TARGET_DISTANCE = 30.0;
-const double EXTRA_GAP_DISTANCE = 30.0; // Extra space when Decoupled (Total 60m)
+const double EXTRA_GAP_DISTANCE = 30.0;
 const double TIMEOUT_SEC = 2.0;
 const double K_P = 1.0;
 const double GAP_TOLERANCE = 1.0;
@@ -29,7 +29,8 @@ struct TruckState {
     double speed = 0.0;
     double position = 0.0;
     bool emergencyBrake = false;
-    bool isDecoupled = false; // NEW: Are we leaving a gap?
+    bool isDecoupled = false;
+    bool isJamming = false; // <--- NEW: Simulate Comm Failure
     std::map<int, PlatoonMessage> neighbors;
 };
 
@@ -39,11 +40,11 @@ pthread_mutex_t stateMutex;
 struct TruckRank {
     int id;
     double position;
-    bool isDecoupled; // Store this for ranking logic
+    bool isDecoupled;
 };
 
 // ==========================================
-// THREAD 1: COMMUNICATION
+// THREAD 1: COMMUNICATION (With Failure Sim)
 // ==========================================
 void* commsLoop(void* arg) {
     NetworkModule* net = (NetworkModule*)arg;
@@ -57,31 +58,34 @@ void* commsLoop(void* arg) {
             pthread_mutex_unlock(&stateMutex);
         }
 
+        // --- NEW: ONLY BROADCAST IF RADIO IS WORKING ---
+        bool currentlyJamming = false;
+
         PlatoonMessage myMsg;
         pthread_mutex_lock(&stateMutex);
+        currentlyJamming = state.isJamming; // Check status
+
         myMsg.truckId = state.id;
         myMsg.position = state.position;
         myMsg.speed = state.speed;
         myMsg.emergencyBrake = state.emergencyBrake;
-
-        // --- NEW: Send Decoupled Status ---
-        // Note: We are hijacking the boolean packing or adding a field.
-        // For simplicity, we assume PlatoonMessage has been updated or we reuse a field.
-        // *IMPORTANT*: To make this work without changing common.h and breaking Python,
-        // we will pack this into the struct. See common.h note below.
         myMsg.isDecoupled = state.isDecoupled;
-
         myMsg.timestamp = time(NULL);
         pthread_mutex_unlock(&stateMutex);
 
-        net->broadcast(myMsg);
+        if (!currentlyJamming) {
+            net->broadcast(myMsg);
+        }
+        // If jamming, we simply SKIP the broadcast.
+        // Other trucks will think we disappeared.
+
         usleep(50000);
     }
     return NULL;
 }
 
 // ==========================================
-// THREAD 2: INPUT (Added 'd' command)
+// THREAD 2: INPUT (Added 'j')
 // ==========================================
 void* inputLoop(void* arg) {
     while(true) {
@@ -96,13 +100,20 @@ void* inputLoop(void* arg) {
                 pthread_mutex_unlock(&stateMutex);
                 break;
 
-            case 'd': // NEW: Decouple (Create Gap)
+            case 'd': // Decouple
                 pthread_mutex_lock(&stateMutex);
                 state.isDecoupled = !state.isDecoupled;
-                if (state.isDecoupled)
-                    std::cout << ">>> DECOUPLING (Opening Gap) <<<\n";
+                std::cout << (state.isDecoupled ? ">>> DECOUPLING" : ">>> COUPLING") << "\n";
+                pthread_mutex_unlock(&stateMutex);
+                break;
+
+            case 'j': // NEW: Simulate Comm Failure
+                pthread_mutex_lock(&stateMutex);
+                state.isJamming = !state.isJamming;
+                if (state.isJamming)
+                    std::cout << ">>> RADIO FAILURE SIMULATED (Jamming) <<<\n";
                 else
-                    std::cout << ">>> COUPLING (Closing Gap) <<<\n";
+                    std::cout << ">>> RADIO RESTORED <<<\n";
                 pthread_mutex_unlock(&stateMutex);
                 break;
 
@@ -113,7 +124,7 @@ void* inputLoop(void* arg) {
 }
 
 // ==========================================
-// MAIN LOGIC LOOP (Gap Propagation)
+// MAIN LOGIC LOOP
 // ==========================================
 void logicLoop() {
     double dt = 0.1;
@@ -122,9 +133,10 @@ void logicLoop() {
         pthread_mutex_lock(&stateMutex);
         long now = time(NULL);
 
-        // 1. CLEANUP
+        // 1. CLEANUP (The robust part: Remove trucks that stop talking)
         for (auto it = state.neighbors.begin(); it != state.neighbors.end(); ) {
             if (now - it->second.timestamp > TIMEOUT_SEC) {
+                // Determine if this is a "Communication Failure" handling
                 it = state.neighbors.erase(it);
             } else {
                 ++it;
@@ -158,14 +170,13 @@ void logicLoop() {
                     if (state.emergencyBrake) {
                         state.speed = 0.0;
                     } else {
-                        // 1. Sorting Logic
+                        // Sorting & Rank Logic
                         std::vector<TruckRank> platoon;
                         platoon.push_back({state.id, state.position, state.isDecoupled});
                         for (auto const& [nid, msg] : state.neighbors) {
                             platoon.push_back({nid, msg.position, msg.isDecoupled});
                         }
 
-                        // Sort Descending (Furthest first)
                         std::sort(platoon.begin(), platoon.end(), [](const TruckRank& a, const TruckRank& b) {
                             return a.position > b.position;
                         });
@@ -174,28 +185,21 @@ void logicLoop() {
                         int decoupledCountAhead = 0;
                         int truckDirectlyAheadId = -1;
 
-                        // 2. Calculate Rank AND Extra Gaps
-                        // We must sum up the gaps of everyone ahead of us
                         for (int i = 0; i < platoon.size(); i++) {
                             if (platoon[i].id == state.id) {
                                 myRank = i;
                                 if (i > 0) truckDirectlyAheadId = platoon[i-1].id;
-                                // Include MYOWN decoupling request in the gap calculation
                                 if (state.isDecoupled) decoupledCountAhead++;
                                 break;
                             }
-                            // If a truck ahead is decoupled, it pushes ME back too
-                            if (platoon[i].isDecoupled) {
-                                decoupledCountAhead++;
-                            }
+                            if (platoon[i].isDecoupled) decoupledCountAhead++;
                         }
 
-                        // 3. Calculate Targets (Base Distance + Extra Decouple Distance)
                         double baseDistance = myRank * TARGET_DISTANCE;
                         double extraDistance = decoupledCountAhead * EXTRA_GAP_DISTANCE;
                         double totalTargetDistance = baseDistance + extraDistance;
 
-                        // Leader Tracking
+                        // Dead Reckoning (Stability during minor packet loss)
                         double leaderPos = state.neighbors[leaderId].position;
                         double leaderSpeed = state.neighbors[leaderId].speed;
                         double timeSinceUpdate = difftime(now, state.neighbors[leaderId].timestamp);
@@ -206,15 +210,10 @@ void logicLoop() {
                         double myTargetPos = leaderPos - totalTargetDistance;
                         double distError = myTargetPos - state.position;
 
-                        // Control
                         double desiredSpeed;
-                        if (std::abs(distError) < GAP_TOLERANCE) {
-                            desiredSpeed = leaderSpeed;
-                        } else {
-                            desiredSpeed = leaderSpeed + (K_P * distError);
-                        }
+                        if (std::abs(distError) < GAP_TOLERANCE) desiredSpeed = leaderSpeed;
+                        else desiredSpeed = leaderSpeed + (K_P * distError);
 
-                        // Safety
                         if (truckDirectlyAheadId != -1 && state.neighbors.count(truckDirectlyAheadId)) {
                             double frontPos = state.neighbors[truckDirectlyAheadId].position;
                             if ((frontPos - state.position) < 20.0) {
@@ -222,7 +221,6 @@ void logicLoop() {
                             }
                         }
 
-                        // Physics
                         if (desiredSpeed > MAX_SPEED) desiredSpeed = MAX_SPEED;
                         if (desiredSpeed < 0) desiredSpeed = 0;
 
@@ -230,6 +228,9 @@ void logicLoop() {
                         else if (state.speed > desiredSpeed) state.speed -= std::min(state.speed - desiredSpeed, MAX_BRAKE * dt);
                     }
                 } else {
+                    // --- FAIL SAFE ---
+                    // "I have lost the leader. It is not safe to drive."
+                    // Decelerate to 0.
                     if (state.speed > 0) state.speed -= MAX_BRAKE * dt;
                     if (state.speed < 0) state.speed = 0;
                 }
@@ -239,23 +240,10 @@ void logicLoop() {
 
         state.position += state.speed * dt;
 
-        // Logging
         if (state.id != 0) {
              std::cout << "[T" << state.id << "] ";
-             if (state.isDecoupled) std::cout << "(DECOUPLED) ";
-             std::cout << "Spd: " << (state.speed * 3.6) << " km/h";
-
-             // Check gap
-             int aheadId = -1;
-             double minDiff = 99999.0;
-             for (auto const& [nid, msg] : state.neighbors) {
-                 double diff = msg.position - state.position;
-                 if (diff > 0 && diff < minDiff) { minDiff = diff; aheadId = nid; }
-             }
-             if(aheadId != -1) {
-                 std::cout << " | Behind T" << aheadId << ": " << std::fixed << std::setprecision(1) << minDiff << "m";
-             }
-             std::cout << "\n";
+             if (state.isJamming) std::cout << "(NO SIGNAL) ";
+             std::cout << "Spd: " << (state.speed * 3.6) << " km/h\n";
         }
 
         pthread_mutex_unlock(&stateMutex);
@@ -264,8 +252,8 @@ void logicLoop() {
 }
 
 int main() {
-    std::cout << "--- CACC PLATOON WITH DECOUPLING ---\n";
-    std::cout << "Press 'd' to Open/Close gap for merging traffic.\n";
+    std::cout << "--- ROBUST PLATOON SYSTEM ---\n";
+    std::cout << "Keys: 'b'=Brake, 'd'=Decouple, 'j'=Simulate Failure\n";
     std::cout << "Enter Truck ID: ";
     std::cin >> state.id;
 
@@ -274,27 +262,19 @@ int main() {
         std::cin >> state.targetPlatoonSize;
     }
 
-    // Initialize Position
     state.position = -(state.id * TARGET_DISTANCE);
 
-    // Initialize Mutex
     if (pthread_mutex_init(&stateMutex, NULL) != 0) return 1;
 
-    // Setup Network
     NetworkModule net(state.id);
     net.flush();
 
-    // 1. Start Communication Thread
     pthread_t commsThreadId;
     pthread_create(&commsThreadId, NULL, commsLoop, (void*)&net);
 
-    // 2. Start Input Thread (For EVERYONE now, not just Leader)
-    // --- FIX: Removed "if (state.id == 0)" check here ---
     pthread_t inputThreadId;
     pthread_create(&inputThreadId, NULL, inputLoop, NULL);
 
-    // 3. Start Logic Loop
     logicLoop();
-
     return 0;
 }
