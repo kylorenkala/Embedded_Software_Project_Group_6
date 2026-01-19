@@ -3,7 +3,7 @@
 #pragma once
 
 constexpr int PORT_BASE = 5000;
-constexpr int VISUALIZER_PORT = 4999; // <--- NEW: The Camera Port
+constexpr int VISUALIZER_PORT = 4999;
 
 struct PlatoonMessage {
     int truckId;
