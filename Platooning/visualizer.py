@@ -41,11 +41,28 @@ def parse_packet(data):
 class PlatoonVisualizer:
     def __init__(self, root):
         self.root = root
-        self.root.title("🚛 Distributed Platoon Simulation (Position Sort)")
-        self.root.attributes("-fullscreen", True)
+        self.root.title("🚛 Distributed Platoon Simulation")
+        
+        # --- 1. SET YOUR CUSTOM SIZE HERE ---
+        # Change these numbers to whatever you want!
+        # Examples: 800x600, 1280x720, 1000x500
+        WINDOW_WIDTH = 1900
+        WINDOW_HEIGHT = 600
+        
+        self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
+        
+        # --- 2. DISABLE FULLSCREEN ---
+        # Comment this line out by adding a # at the start
+        # self.root.attributes("-fullscreen", True) 
+
         self.root.bind("<Escape>", self.close_fullscreen)
-        self.screen_w = self.root.winfo_screenwidth()
-        self.screen_h = self.root.winfo_screenheight()
+
+        # --- 3. TELL THE LOGIC YOUR NEW SIZE ---
+        # We manually set these so the drawing code knows where the center is
+        self.screen_w = WINDOW_WIDTH
+        self.screen_h = WINDOW_HEIGHT
+
+        # ... (Rest of the code remains the same) ...
         self.canvas = tk.Canvas(root, bg="#222222", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.smooth_distances = {} 
