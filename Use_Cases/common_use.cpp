@@ -1,75 +1,79 @@
 #ifndef COMMON_H
 #define COMMON_H
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <iostream>
 #include <pthread.h>
-#include <cmath>
+#include <stdint.h>
 
 // ========== Safety Constants ==========
-
 const double MIN_SAFE_DISTANCE = 10.0;
 const double EMERGENCY_DECEL = 8.0;
-const int HEARTBEAT_TIMEOUT = 5;
 const int MAX_TRUCKS = 8;
 
-// ========== Shared Memory Structures ==========
+// ========== Message Structures (from main's perspective) ==========
 
-// Data FROM truck TO main_frame
-struct TruckToMain {
-    double currentSpeed;
-    bool registered;
-    bool emergencyBrake;
-    int missedHeartbeats;
+// Truck sends position to main_frame
+struct rxMainMessageFrame {
+    unsigned short position;
+    unsigned short speed;
+    bool emergency_brake;
+    bool request_ready;
 };
 
-// Data FROM main_frame TO truck
-struct MainToTruck {
-    uint64_t tick;
-    double distanceToFront;
-    bool obstacleDetected;
-    bool isLeader;
+// Main_frame sends sensor data to truck
+struct txMainMessageFrame {
+    unsigned short sensor_data;      // distance to front truck
+    bool obstacle_detected;
+    bool response_ready;
 };
 
-// Leader communication (UDP replacement via shared memory)
-struct LeaderCommands {
-    double desiredDistance;
-    bool emergencyBrakeAll;
+// Leader sends commands to followers
+struct LeaderCommandFrame {
+    unsigned short distance_setpoint;
+    bool emergency_brake_all;
 };
 
-struct FollowerStatus {
-    int truckId;
-    double reportedDistance;
-    bool isActive;
-    bool emergencyActive;
+// Follower reports status to leader
+struct FollowerReportFrame {
+    unsigned short actual_distance;
+    bool emergency_active;
+    bool is_active;
 };
 
-// Main shared memory layout
-struct SharedMemory {
-    pthread_mutex_t mutex;
+// ========== Shared Memory Layout ==========
+
+struct SharedMemoryLayout {
+    pthread_mutex_t global_mutex;
     
-    // Array for each truck slot
-    TruckToMain truckData[MAX_TRUCKS];
-    MainToTruck mainData[MAX_TRUCKS];
+    // Communication between trucks and main_frame
+    rxMainMessageFrame rx_slots[MAX_TRUCKS];
+    txMainMessageFrame tx_slots[MAX_TRUCKS];
     
     // Leader-follower communication
-    LeaderCommands leaderCmd;
-    FollowerStatus followerStatus[MAX_TRUCKS];
+    LeaderCommandFrame leader_cmd;
+    FollowerReportFrame follower_status[MAX_TRUCKS];
     
     // System state
-    bool systemRunning;
+    uint64_t tick;
+    bool system_running;
 };
 
-// ========== Safety Functions ==========
+// ========== Simple Safety Functions ==========
 
-inline bool isSafeDistance(double distance) {
+inline bool isSafeDistance(unsigned short distance) {
     return distance >= MIN_SAFE_DISTANCE;
 }
 
-inline double calculateStoppingDistance(double speed) {
-    // d = v^2 / (2a) with 20% safety margin
-    return (speed * speed) / (2.0 * EMERGENCY_DECEL) * 1.2;
+inline unsigned short calculateStoppingDistance(unsigned short speed) {
+    // d = v^2 / (2a) with safety margin
+    double speed_d = speed;
+    return (unsigned short)((speed_d * speed_d) / (2.0 * EMERGENCY_DECEL) * 1.2);
 }
 
-inline bool isCollisionRisk(double distance, double speed) {
+inline bool isCollisionRisk(unsigned short distance, unsigned short speed) {
     return distance < calculateStoppingDistance(speed);
 }
 
