@@ -12,6 +12,7 @@ struct PlatoonMessage {
     bool emergencyBrake;
     bool isDecoupled;
     long timestamp;
+    bool isRadarOnly;
 };
 
 #endif

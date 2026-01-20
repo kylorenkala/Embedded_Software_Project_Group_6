@@ -12,7 +12,8 @@ class TruckNode {
 private:
     int id;
     int targetPlatoonSize = 1;
-    
+    double jammingTimer = 0.0;
+
     // Components
     std::unique_ptr<NetworkModule> net;
     VehiclePhysics physics;

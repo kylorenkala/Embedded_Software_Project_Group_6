@@ -3,8 +3,11 @@
 #include <iomanip>
 #include <unistd.h>
 
-TruckNode::TruckNode(int truckId) 
-    : id(truckId), physics(truckId, TARGET_DISTANCE) 
+const double GHOST_TIMEOUT = 10.0;
+const double SIGNAL_TIMEOUT = 2.0;
+
+TruckNode::TruckNode(int truckId)
+    : id(truckId), physics(truckId, TARGET_DISTANCE)
 {
     pthread_mutex_init(&stateMutex, nullptr);
     net = std::make_unique<NetworkModule>(id);
@@ -49,7 +52,7 @@ void TruckNode::runCommunication() {
         if (!jamming) {
             net->broadcast(myMsg);
         }
-        usleep(50000); 
+        usleep(50000);
     }
 }
 
@@ -61,23 +64,25 @@ void TruckNode::runInput() {
         std::cin >> c;
         pthread_mutex_lock(&stateMutex);
         switch(c) {
-            case 'b': emergencyBrake = !emergencyBrake; 
+            case 'b': emergencyBrake = !emergencyBrake;
                       std::cout << (emergencyBrake ? "!!! BRAKING !!!" : ">>> RESUMING") << std::endl; break;
-            case 'd': isDecoupled = !isDecoupled; 
+            case 'd': isDecoupled = !isDecoupled;
                       std::cout << (isDecoupled ? ">>> DECOUPLING" : ">>> COUPLING") << std::endl; break;
-            case 'j': isJamming = !isJamming; 
+            case 'j': isJamming = !isJamming;
                       std::cout << (isJamming ? ">>> JAMMING ON" : ">>> JAMMING OFF") << std::endl; break;
         }
         pthread_mutex_unlock(&stateMutex);
     }
 }
-const double GHOST_TIMEOUT = 10.0;
-const double SIGNAL_TIMEOUT = 2.0;
+
 // --- THREAD 3: LOGIC (MAIN) ---
+// In TruckNode.cpp
+
 void TruckNode::runLogic() {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
     while (true) {
+        // 1. Calculate Delta Time (dt)
         auto now = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = now - lastTime;
         double dt = elapsed.count();
@@ -85,20 +90,41 @@ void TruckNode::runLogic() {
 
         pthread_mutex_lock(&stateMutex);
 
-        cleanupOldNeighbors(); // Deletes only after 10 seconds
+        // 2. Cleanup "Dead" Trucks (> 10s silence)
+        cleanupOldNeighbors();
 
+        // 3. JAMMING LOGIC
         if (isJamming) {
-            physics.emergencyStop(dt);
-        } else {
+            // Increment timer
+            jammingTimer += dt;
+
+            if (jammingTimer < 10.0) {
+                // PHASE 1: BLIND CRUISE (0 - 10 seconds)
+                // "Drive on constant speed (50kmh)" ignoring sensors
+                double blindSpeed = 50.0 / 3.6; // 13.8 m/s
+                physics.update(blindSpeed, dt);
+
+                if (id == 0) std::cout << " [JAMMED] Blind Cruising (" << (10.0 - jammingTimer) << "s left)\r";
+            } else {
+                // PHASE 2: EMERGENCY STOP (> 10 seconds)
+                physics.emergencyStop(dt);
+                if (id == 0) std::cout << " [JAMMED] Timeout! Stopping.\r";
+            }
+        }
+        else {
+            // NORMAL OPERATION
+            jammingTimer = 0.0; // Reset timer
+
             // --- GHOST LOGIC START ---
-            // 1. Create a temporary copy of neighbors so we don't mess up the real data
+            // Create a temporary copy of neighbors to modify for the Controller.
+            // We use a copy so we don't corrupt the actual network data.
             std::map<int, PlatoonMessage> percepts = neighbors;
             long currentTime = time(nullptr);
 
             for (auto& kv : percepts) {
                 double age = difftime(currentTime, kv.second.timestamp);
 
-                // 2. If signal is "Stale" (> 2.0s) but not "Dead" (< 10.0s)
+                // If signal is "Stale" (> 2.0s) but not yet deleted (< 10.0s)
                 if (age > SIGNAL_TIMEOUT) {
                     // Force the logic to treat it as a STOPPED obstacle
                     kv.second.speed = 0.0;
@@ -110,22 +136,32 @@ void TruckNode::runLogic() {
             }
             // --- GHOST LOGIC END ---
 
-            // 3. Pass the 'percepts' (the modified copy) to the controller
+            // 4. CALCULATE TARGET SPEED
+            // CRITICAL FIX: We pass 'physics.getSpeed()' as the 3rd argument.
+            // This allows the controller to calculate Stopping Distance.
             double targetSpeed = controller.calculateTargetSpeed(
-                id, physics.getPosition(), percepts, isDecoupled, emergencyBrake, targetPlatoonSize
+                id,
+                physics.getPosition(),
+                physics.getSpeed(),    // <--- NEW ARGUMENT (Fixes Crashing)
+                percepts,              // Use the 'Ghost-Aware' map copy
+                isDecoupled,
+                emergencyBrake,
+                targetPlatoonSize
             );
 
+            // 5. UPDATE PHYSICS
             physics.update(targetSpeed, dt);
         }
 
         logStatus();
         pthread_mutex_unlock(&stateMutex);
 
+        // Run at ~20 Hz
         usleep(50000);
     }
 }
 
-
+;
 void TruckNode::cleanupOldNeighbors() {
     long now = time(nullptr);
 
