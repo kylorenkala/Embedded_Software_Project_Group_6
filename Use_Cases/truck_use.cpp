@@ -1,99 +1,87 @@
 #include <iostream>
-#include <map>
 #include <iomanip>
-#include <string>
-#include <mqueue.h>
-#include <arpa/inet.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
+#include <cstring>
 #include "common.h"
-
-// ========== Helpers ==========
-
-std::string hbQueue(int id) {
-    return "/mq_hb_" + std::to_string(id);
-}
-
-std::string sensorQueue(int id) {
-    return "/mq_sensor_" + std::to_string(id);
-}
 
 // ========== Follower ==========
 
-void runFollower(int id) {
-    mqd_t mqHb = mq_open(hbQueue(id).c_str(), O_RDONLY | O_NONBLOCK);
-    mqd_t mqSn = mq_open(sensorQueue(id).c_str(), O_RDONLY | O_NONBLOCK);
-
-    int udpTx = socket(AF_INET, SOCK_DGRAM, 0);
-    int udpRx = socket(AF_INET, SOCK_DGRAM, 0);
-
-    sockaddr_in rx{};
-    rx.sin_family = AF_INET;
-    rx.sin_port = htons(6000);
-    rx.sin_addr.s_addr = INADDR_ANY;
-    bind(udpRx, (sockaddr*)&rx, sizeof(rx));
-
-    sockaddr_in leader{};
-    leader.sin_family = AF_INET;
-    leader.sin_port = htons(6001);
-    inet_pton(AF_INET, "127.0.0.1", &leader.sin_addr);
-
-    // Join platoon
-    LeaderMsg join{LeaderMsgType::Join, id, 0.0};
-    sendto(udpTx, &join, sizeof(join), 0,
-           (sockaddr*)&leader, sizeof(leader));
-    std::cout << "[Follower " << id << "] Joining platoon\n";
-
+void runFollower(int id, SharedMemory* shm) {
     double speed = 0.0;
     double desiredDistance = 20.0;
     double actualDistance = 20.0;
     bool emergencyMode = false;
-    int missedHeartbeats = 0;
+    int localMissedHeartbeats = 0;
+    uint64_t lastTick = 0;
+
+    std::cout << "[Follower " << id << "] Starting...\n";
+    
+    // Register with main_frame via shared memory
+    pthread_mutex_lock(&shm->mutex);
+    shm->followerStatus[id].isActive = true;
+    shm->followerStatus[id].truckId = id;
+    pthread_mutex_unlock(&shm->mutex);
 
     while (true) {
-        // Check heartbeat
-        Heartbeat hb;
-        if (mq_receive(mqHb, (char*)&hb, sizeof(hb), nullptr) > 0) {
-            missedHeartbeats = 0;
+        pthread_mutex_lock(&shm->mutex);
+        
+        // Check if system is still running
+        if (!shm->systemRunning) {
+            pthread_mutex_unlock(&shm->mutex);
+            std::cout << "[Follower " << id << "] System shutdown\n";
+            break;
+        }
+        
+        // Check heartbeat (tick update)
+        if (shm->mainData[id].tick > lastTick) {
+            lastTick = shm->mainData[id].tick;
+            localMissedHeartbeats = 0;
         } else {
-            missedHeartbeats++;
-            if (missedHeartbeats >= HEARTBEAT_TIMEOUT) {
+            localMissedHeartbeats++;
+            if (localMissedHeartbeats >= HEARTBEAT_TIMEOUT) {
                 std::cerr << "[Follower " << id << "] Lost communication! Emergency stop\n";
                 emergencyMode = true;
             }
         }
-
-        // Read sensors
-        SensorMsg s;
-        while (mq_receive(mqSn, (char*)&s, sizeof(s), nullptr) > 0) {
-            actualDistance = s.distanceToFront;
-            
-            // Obstacle detected?
-            if (s.obstacleDetected && !emergencyMode) {
-                std::cout << "[Follower " << id << "] OBSTACLE! Emergency brake\n";
-                emergencyMode = true;
-                LeaderMsg brake{LeaderMsgType::EmergencyBrake, id, actualDistance};
-                sendto(udpTx, &brake, sizeof(brake), 0,
-                       (sockaddr*)&leader, sizeof(leader));
-            }
+        
+        // Read sensor data
+        actualDistance = shm->mainData[id].distanceToFront;
+        
+        // Check for obstacle
+        if (shm->mainData[id].obstacleDetected && !emergencyMode) {
+            std::cout << "[Follower " << id << "] OBSTACLE! Emergency brake\n";
+            emergencyMode = true;
+            shm->truckData[id].emergencyBrake = true;
+            shm->followerStatus[id].emergencyActive = true;
         }
-
+        
         // Read leader commands
-        SetpointMsg sp;
-        if (recvfrom(udpRx, &sp, sizeof(sp), MSG_DONTWAIT, nullptr, nullptr) > 0) {
-            desiredDistance = sp.desiredDistance;
-            
-            if (sp.emergencyBrake && !emergencyMode) {
-                std::cout << "[Follower " << id << "] Leader emergency signal\n";
-                emergencyMode = true;
-            }
+        desiredDistance = shm->leaderCmd.desiredDistance;
+        
+        if (shm->leaderCmd.emergencyBrakeAll && !emergencyMode) {
+            std::cout << "[Follower " << id << "] Leader emergency signal\n";
+            emergencyMode = true;
         }
-
+        
+        // Update follower status
+        shm->followerStatus[id].reportedDistance = actualDistance;
+        shm->truckData[id].currentSpeed = speed;
+        shm->truckData[id].missedHeartbeats = localMissedHeartbeats;
+        
+        pthread_mutex_unlock(&shm->mutex);
+        
         // Safety check: collision risk?
         if (!emergencyMode && isCollisionRisk(actualDistance, speed)) {
             std::cout << "[Follower " << id << "] Collision risk! Braking\n";
             emergencyMode = true;
+            
+            pthread_mutex_lock(&shm->mutex);
+            shm->followerStatus[id].emergencyActive = true;
+            pthread_mutex_unlock(&shm->mutex);
         }
-
+        
         // Control logic
         if (emergencyMode) {
             // Emergency brake
@@ -101,6 +89,11 @@ void runFollower(int id) {
             if (speed <= 0.1) {
                 speed = 0.0;
                 emergencyMode = false; // Can resume
+                
+                pthread_mutex_lock(&shm->mutex);
+                shm->truckData[id].emergencyBrake = false;
+                shm->followerStatus[id].emergencyActive = false;
+                pthread_mutex_unlock(&shm->mutex);
             }
         } else {
             // Normal distance control
@@ -114,12 +107,7 @@ void runFollower(int id) {
             if (speed < 0.0) speed = 0.0;
             if (speed > 25.0) speed = 25.0;
         }
-
-        // Report to leader
-        LeaderMsg dist{LeaderMsgType::Distance, id, actualDistance};
-        sendto(udpTx, &dist, sizeof(dist), 0,
-               (sockaddr*)&leader, sizeof(leader));
-
+        
         // Display status
         std::string status = emergencyMode ? "EMERGENCY" : "NORMAL";
         std::string safe = isSafeDistance(actualDistance) ? "SAFE" : "UNSAFE";
@@ -128,133 +116,179 @@ void runFollower(int id) {
                   << "speed=" << std::fixed << std::setprecision(1) << speed
                   << " dist=" << actualDistance 
                   << " [" << status << "/" << safe << "]\n";
-
+        
         sleep(1);
     }
+    
+    // Unregister
+    pthread_mutex_lock(&shm->mutex);
+    shm->followerStatus[id].isActive = false;
+    pthread_mutex_unlock(&shm->mutex);
 }
 
 // ========== Leader ==========
 
-void runLeader(int id) {
-    mqd_t mqHb = mq_open(hbQueue(id).c_str(), O_RDONLY);
-
-    int udpTx = socket(AF_INET, SOCK_DGRAM, 0);
-    int udpRx = socket(AF_INET, SOCK_DGRAM, 0);
-
-    sockaddr_in tx{};
-    tx.sin_family = AF_INET;
-    tx.sin_port = htons(6000);
-    inet_pton(AF_INET, "127.0.0.1", &tx.sin_addr);
-
-    sockaddr_in rx{};
-    rx.sin_family = AF_INET;
-    rx.sin_port = htons(6001);
-    rx.sin_addr.s_addr = INADDR_ANY;
-    bind(udpRx, (sockaddr*)&rx, sizeof(rx));
-
+void runLeader(int id, SharedMemory* shm) {
     double desiredDistance = 20.0;
     bool emergencyBrake = false;
-    std::map<int, double> distances;
 
-    std::cout << "[Leader " << id << "] Commands: +/- distance, e=emergency, r=reset, q=quit\n";
+    std::cout << "[Leader " << id << "] Starting...\n";
+    std::cout << "Commands: +/- distance, e=emergency, r=reset, q=quit\n";
 
     while (true) {
-        Heartbeat hb;
-        mq_receive(mqHb, (char*)&hb, sizeof(hb), nullptr);
-
+        pthread_mutex_lock(&shm->mutex);
+        
+        // Check if system is still running
+        if (!shm->systemRunning) {
+            pthread_mutex_unlock(&shm->mutex);
+            std::cout << "[Leader " << id << "] System shutdown\n";
+            break;
+        }
+        
+        pthread_mutex_unlock(&shm->mutex);
+        
         // User input
         if (std::cin.rdbuf()->in_avail()) {
             char c;
             std::cin >> c;
-            if (c == '+') desiredDistance += 2.0;
-            if (c == '-') desiredDistance -= 2.0;
-            if (c == 'e') {
+            
+            if (c == '+') {
+                desiredDistance += 2.0;
+            }
+            else if (c == '-') {
+                desiredDistance -= 2.0;
+                if (desiredDistance < 10.0) desiredDistance = 10.0;
+            }
+            else if (c == 'e') {
                 emergencyBrake = true;
                 std::cout << "[Leader] EMERGENCY BRAKE ACTIVATED\n";
             }
-            if (c == 'r') {
+            else if (c == 'r') {
                 emergencyBrake = false;
                 std::cout << "[Leader] Emergency reset\n";
             }
-            if (c == 'q') {
+            else if (c == 'q') {
                 std::cout << "[Leader] Shutting down\n";
+                pthread_mutex_lock(&shm->mutex);
+                shm->systemRunning = false;
+                pthread_mutex_unlock(&shm->mutex);
                 break;
             }
         }
-
-        // Send commands to followers
-        SetpointMsg sp{desiredDistance, emergencyBrake};
-        sendto(udpTx, &sp, sizeof(sp), 0,
-               (sockaddr*)&tx, sizeof(tx));
-
-        // Receive follower messages
-        LeaderMsg msg;
-        while (recvfrom(udpRx, &msg, sizeof(msg),
-                        MSG_DONTWAIT, nullptr, nullptr) > 0) {
-            
-            if (msg.type == LeaderMsgType::Join) {
-                distances[msg.truckId] = 0.0;
-                std::cout << "[Leader] Truck " << msg.truckId << " joined\n";
-            }
-            else if (msg.type == LeaderMsgType::Leave) {
-                distances.erase(msg.truckId);
-                std::cout << "[Leader] Truck " << msg.truckId << " left\n";
-            }
-            else if (msg.type == LeaderMsgType::Distance) {
-                distances[msg.truckId] = msg.distance;
-            }
-            else if (msg.type == LeaderMsgType::EmergencyBrake) {
-                if (!emergencyBrake) {
-                    std::cout << "[Leader] Truck " << msg.truckId 
-                              << " triggered emergency brake!\n";
-                    emergencyBrake = true;
-                }
+        
+        // Write commands to shared memory
+        pthread_mutex_lock(&shm->mutex);
+        shm->leaderCmd.desiredDistance = desiredDistance;
+        shm->leaderCmd.emergencyBrakeAll = emergencyBrake;
+        
+        // Check for follower emergencies
+        for (int i = 0; i < MAX_TRUCKS; i++) {
+            if (shm->followerStatus[i].isActive && 
+                shm->followerStatus[i].emergencyActive && 
+                !emergencyBrake) {
+                std::cout << "[Leader] Truck " << i << " triggered emergency!\n";
+                emergencyBrake = true;
+                shm->leaderCmd.emergencyBrakeAll = true;
             }
         }
-
-        // Display platoon
+        
+        pthread_mutex_unlock(&shm->mutex);
+        
+        // Display platoon status
         std::cout << "\033[2J\033[H"; // Clear screen
-        std::cout << "=== PLATOON STATUS ===\n";
+        std::cout << "=== PLATOON STATUS (Shared Memory) ===\n";
         std::cout << "Desired Distance: " << desiredDistance << "m | ";
         std::cout << "Emergency: " << (emergencyBrake ? "ACTIVE" : "OFF") << "\n\n";
-
+        
         std::cout << "+--------------+";
-        for (auto& p : distances)
-            std::cout << "           +--------------+";
-        std::cout << "\n|  Leader " << id << "   |";
-
-        for (auto& p : distances) {
-            std::cout << "  " << std::setw(4) << (int)p.second << "m  "
-                      << "| Truck " << p.first << "     |";
+        
+        pthread_mutex_lock(&shm->mutex);
+        
+        int followerCount = 0;
+        for (int i = 0; i < MAX_TRUCKS; i++) {
+            if (shm->followerStatus[i].isActive) {
+                std::cout << "           +--------------+";
+                followerCount++;
+            }
         }
-        std::cout << "\n\n";
+        std::cout << "\n|  Leader " << id << "   |";
+        
+        for (int i = 0; i < MAX_TRUCKS; i++) {
+            if (shm->followerStatus[i].isActive) {
+                double dist = shm->followerStatus[i].reportedDistance;
+                std::string status = shm->followerStatus[i].emergencyActive ? "!" : " ";
+                std::cout << "  " << std::setw(4) << (int)dist << "m " << status
+                          << "| Truck " << i << "     |";
+            }
+        }
+        
+        pthread_mutex_unlock(&shm->mutex);
+        
+        std::cout << "\n\nFollowers: " << followerCount << "\n";
+        
+        sleep(1);
     }
-
-    // Cleanup
-    mq_close(mqHb);
-    close(udpTx);
-    close(udpRx);
 }
 
 // ========== Main ==========
 
-int main() {
-    int id;
-    char role;
-
-    std::cout << "Truck ID: ";
-    std::cin >> id;
-    std::cout << "Role (l/f): ";
-    std::cin >> role;
-
-    if (role == 'l')
-        runLeader(id);
-    else
-        runFollower(id);
-
-    // Cleanup queues
-    mq_unlink(hbQueue(id).c_str());
-    mq_unlink(sensorQueue(id).c_str());
-
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        std::cout << "Usage: " << argv[0] << " <truck_id> <role:l/f>\n";
+        std::cout << "Example: " << argv[0] << " 1 l  (truck 1 as leader)\n";
+        std::cout << "Example: " << argv[0] << " 2 f  (truck 2 as follower)\n";
+        return 1;
+    }
+    
+    int id = std::atoi(argv[1]);
+    char role = argv[2][0];
+    
+    if (id < 0 || id >= MAX_TRUCKS) {
+        std::cerr << "Truck ID must be 0-" << (MAX_TRUCKS-1) << "\n";
+        return 1;
+    }
+    
+    const char* SHM_NAME = "/platoon_shared_memory";
+    
+    // Open shared memory
+    int shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
+    if (shm_fd == -1) {
+        std::cerr << "Failed to open shared memory. Is main_frame running?\n";
+        return 1;
+    }
+    
+    SharedMemory* shm = (SharedMemory*)mmap(
+        nullptr,
+        sizeof(SharedMemory),
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        shm_fd,
+        0
+    );
+    
+    if (shm == MAP_FAILED) {
+        std::cerr << "Failed to map shared memory\n";
+        return 1;
+    }
+    
+    // Register truck
+    pthread_mutex_lock(&shm->mutex);
+    shm->truckData[id].registered = true;
+    pthread_mutex_unlock(&shm->mutex);
+    
+    if (role == 'l') {
+        runLeader(id, shm);
+    } else {
+        runFollower(id, shm);
+    }
+    
+    // Cleanup
+    pthread_mutex_lock(&shm->mutex);
+    shm->truckData[id].registered = false;
+    pthread_mutex_unlock(&shm->mutex);
+    
+    munmap(shm, sizeof(SharedMemory));
+    close(shm_fd);
+    
     return 0;
 }
