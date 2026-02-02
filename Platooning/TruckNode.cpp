@@ -3,45 +3,62 @@
 #include <iomanip>
 #include <unistd.h>
 #include <cmath>
-#include <vector>    // <--- REQUIRED FOR OPENMP
-#include <omp.h>     // <--- REQUIRED FOR OPENMP
+#include <vector>
+#include <omp.h>
+#include <sstream>
 
 // Constants
-const double FAILURE_TIMEOUT = 10.0; // Stop after 10s of no signal
-const double SIGNAL_TIMEOUT = 2.0;   // Consider signal lost after 2s
+const double FAILURE_TIMEOUT = 10.0;
+const double SIGNAL_TIMEOUT = 10.0;
 
 TruckNode::TruckNode(int truckId) : id(truckId), physics(truckId, TARGET_DISTANCE) {
     pthread_mutex_init(&stateMutex, nullptr);
     net = std::make_unique<NetworkModule>(id);
 
-    // Initialize Matrix Clock to 0
     for(int i=0; i<MAX_NODES; i++) {
         for(int j=0; j<MAX_NODES; j++) {
             myMatrix[i][j] = 0;
         }
     }
 
-    // Open Log File
-    std::string filename = "truck_log_" + std::to_string(id) + ".txt";
-    logFile.open(filename);
-    if (logFile.is_open()) {
-        logFile << "=== Truck " << id << " Log Started (OpenMP Enabled) ===\n";
+    // LOGGING SETUP
+    eventLog.open("truck_events_" + std::to_string(id) + ".txt");
+    if (eventLog.is_open()) {
+        eventLog << "=== Truck " << id << " Event Log ===\n";
+        eventLog << "Timestamp, Event_Type, Description\n";
     }
+
+    dataLog.open("truck_data_" + std::to_string(id) + ".csv");
+    if (dataLog.is_open()) {
+        dataLog << "sep=,\n";
+        dataLog << "Time,Position,Speed_kmh,Target_Speed,Gap_Front,Is_Jammed,Emergency_Brake\n";
+    }
+
+    matrixLog.open("truck_matrix_" + std::to_string(id) + ".txt");
 }
 
 TruckNode::~TruckNode() {
-    if (logFile.is_open()) logFile.close();
+    if (eventLog.is_open()) eventLog.close();
+    if (dataLog.is_open()) dataLog.close();
+    if (matrixLog.is_open()) matrixLog.close();
     pthread_mutex_destroy(&stateMutex);
 }
 
 void TruckNode::setTargetPlatoonSize(int size) {
     targetPlatoonSize = size;
+    logEvent("CONFIG", "Target Platoon Size set to " + std::to_string(size));
 }
 
-// --- THREAD 1: COMMUNICATION (Unchanged) ---
+void TruckNode::logEvent(std::string type, std::string desc) {
+    if (!eventLog.is_open()) return;
+    long now = time(nullptr);
+    eventLog << now << ", " << type << ", " << desc << "\n";
+    eventLog.flush();
+}
+
+// --- THREAD 1: COMMUNICATION ---
 void TruckNode::runCommunication() {
     while (true) {
-        // RECEIVE
         while (true) {
             PlatoonMessage msg{};
             if (!net->receive(msg)) break;
@@ -50,7 +67,6 @@ void TruckNode::runCommunication() {
             neighbors[msg.truckId] = msg;
             neighbors[msg.truckId].timestamp = time(nullptr);
 
-            // Update Matrix Clock
             for(int i=0; i<MAX_NODES; i++) {
                 for(int j=0; j<MAX_NODES; j++) {
                     myMatrix[i][j] = std::max(myMatrix[i][j], msg.matrixClock[i][j]);
@@ -62,10 +78,8 @@ void TruckNode::runCommunication() {
             pthread_mutex_unlock(&stateMutex);
         }
 
-        // BROADCAST
         pthread_mutex_lock(&stateMutex);
         bool jamming = isJamming;
-
         PlatoonMessage myMsg{};
         myMsg.truckId = id;
         myMsg.position = physics.getPosition();
@@ -88,7 +102,7 @@ void TruckNode::runCommunication() {
     }
 }
 
-// --- THREAD 2: INPUT (Unchanged) ---
+// --- THREAD 2: INPUT ---
 void TruckNode::runInput(){
     std::cout << "--- INPUT READY ('j'=Jam, 'b'=Brake, 'd'=Decouple) ---\n";
     while (true) {
@@ -96,19 +110,27 @@ void TruckNode::runInput(){
         std::cin >> c;
         pthread_mutex_lock(&stateMutex);
         switch(c) {
-            case 'b': emergencyBrake = !emergencyBrake;
-                      std::cout << (emergencyBrake ? "!!! BRAKING !!!" : ">>> RESUMING") << std::endl; break;
-            case 'd': isDecoupled = !isDecoupled;
-                      std::cout << (isDecoupled ? ">>> DECOUPLING" : ">>> COUPLING") << std::endl; break;
-            case 'j': isJamming = !isJamming;
-                      std::cout << (isJamming ? ">>> JAMMING ON" : ">>> JAMMING OFF") << std::endl; break;
+            case 'b':
+                emergencyBrake = !emergencyBrake;
+                std::cout << (emergencyBrake ? "!!! BRAKING !!!" : ">>> RESUMING") << std::endl;
+                logEvent("INPUT", emergencyBrake ? "User toggled Emergency Brake ON" : "User toggled Emergency Brake OFF");
+                break;
+            case 'd':
+                isDecoupled = !isDecoupled;
+                std::cout << (isDecoupled ? ">>> DECOUPLING" : ">>> COUPLING") << std::endl;
+                logEvent("INPUT", isDecoupled ? "User toggled Decouple ON" : "User toggled Decouple OFF");
+                break;
+            case 'j':
+                isJamming = !isJamming;
+                std::cout << (isJamming ? ">>> JAMMING ON" : ">>> JAMMING OFF") << std::endl;
+                logEvent("INPUT", isJamming ? "User toggled Jamming ON" : "User toggled Jamming OFF");
+                break;
         }
         pthread_mutex_unlock(&stateMutex);
     }
 }
 
-// --- THREAD 3: LOGIC (OPENMP IMPLEMENTED) ---
-// --- THREAD 3: LOGIC (FIXED JAMMING SCENARIO) ---
+// --- THREAD 3: LOGIC ---
 void TruckNode::runLogic() {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -120,44 +142,32 @@ void TruckNode::runLogic() {
 
         pthread_mutex_lock(&stateMutex);
 
-        // 1. Matrix Clock Tick
         if (id < MAX_NODES) myMatrix[id][id]++;
-
-        // 2. Cleanup Old Neighbors
         cleanupOldNeighbors();
 
-        // 3. JAMMING / FAILURE CHECK
-        // We handle jamming FIRST because it overrides everything else.
+        double currentTargetSpeed = 0.0;
+        double gapFront = -1.0;
+
         if (isJamming) {
             jammingTimer += dt;
-
             if (jammingTimer < 10.0) {
-                // PHASE 1: BLIND CRUISE (0 - 10 seconds)
-                // Requirement: "Keep driving for 10 seconds at 30m distance and at 50kmh"
-                // Since we are jammed, we cannot measure distance.
-                // We MUST assume that driving at 50km/h maintains the gap.
-
-                double blindSpeed = 50.0 / 3.6; // 13.8 m/s (50 km/h)
+                double blindSpeed = 50.0 / 3.6;
                 physics.update(blindSpeed, dt);
-
-                if (id != 0) std::cout << " [JAMMED] Blind Cruise (Time: " << std::fixed << std::setprecision(1) << jammingTimer << "s) - Speed: 50 km/h\r";
-            }
-            else {
-                // PHASE 2: EMERGENCY STOP (> 10 seconds)
-                // Requirement: "If comms doesn't restore, whole platoon stops"
+                currentTargetSpeed = blindSpeed;
+                if (id != 0) std::cout << " [JAMMED] Blind Cruise (" << std::fixed << std::setprecision(1) << jammingTimer << "s)\r";
+            } else {
                 physics.emergencyStop(dt);
+                currentTargetSpeed = 0.0;
                 if (id != 0) std::cout << " [JAMMED] TIMEOUT! Emergency Stop.\r";
+                if (jammingTimer - dt < 10.0) {
+                    logEvent("CRITICAL", "Jamming Timeout Exceeded (10s). Initiating Emergency Stop.");
+                }
             }
-        }
-        else {
-            // NORMAL OPERATION (Comms Restored)
+        } else {
             jammingTimer = 0.0;
 
-            // --- OPENMP SENSOR FUSION START ---
             std::vector<PlatoonMessage> sensorData;
             std::vector<int> sensorIds;
-
-            // 1. Flatten Map to Vector for OpenMP
             for (const auto& kv : neighbors) {
                 sensorData.push_back(kv.second);
                 sensorIds.push_back(kv.first);
@@ -166,54 +176,60 @@ void TruckNode::runLogic() {
             int dataSize = sensorData.size();
             long currentTime = time(nullptr);
 
-            // 2. Parallel Processing (OpenMP)
             #pragma omp parallel for
             for (int i = 0; i < dataSize; i++) {
                 double age = difftime(currentTime, sensorData[i].timestamp);
 
-                // Signal Timeout Logic (Ghost Detection)
-                if (age > SIGNAL_TIMEOUT) {
-                    // FIX: Only panic if the ghost is IN FRONT of us.
-                    // If the guy behind me disappears, I don't need to slam the brakes.
-                    double relativePos = sensorData[i].position - physics.getPosition();
+                // --- THE FIX: POSITION EXTRAPOLATION ---
+                // If data is slightly old but valid (<10s), assume the truck kept moving.
+                // This prevents us from braking for a "frozen ghost" during temporary packet loss.
+                if (age > 0.0 && age < FAILURE_TIMEOUT) {
+                    sensorData[i].position += (sensorData[i].speed * age);
+                }
+                // ---------------------------------------
 
-                    if (relativePos > 0) { // It is AHEAD of me
+                if (age > SIGNAL_TIMEOUT) {
+                    double relativePos = sensorData[i].position - physics.getPosition();
+                    if (relativePos > 0) {
                         sensorData[i].speed = 0.0;
                         sensorData[i].emergencyBrake = true;
-                    }
-                    else {
-                        // It is BEHIND me. Ignore it for now so I don't stop.
-                        // (The 10s timeout in 'cleanupOldNeighbors' will handle it later)
                     }
                 }
             }
 
-            // 3. Reconstruct Map for Controller
             std::map<int, PlatoonMessage> processedNeighbors;
             for (int i = 0; i < dataSize; i++) {
                 processedNeighbors[sensorIds[i]] = sensorData[i];
+                if (sensorIds[i] != id) {
+                    double dist = sensorData[i].position - physics.getPosition();
+                    if (dist > 0 && (gapFront < 0 || dist < gapFront)) {
+                        gapFront = dist;
+                    }
+                }
             }
-            // --- OPENMP SENSOR FUSION END ---
 
-            // 4. PID CONTROL
             double targetSpeed = controller.calculateTargetSpeed(
                 id, physics.getPosition(), physics.getSpeed(),
-                processedNeighbors,
-                isDecoupled, emergencyBrake, targetPlatoonSize
+                processedNeighbors, isDecoupled, emergencyBrake, targetPlatoonSize
             );
+
+            currentTargetSpeed = targetSpeed;
             physics.update(targetSpeed, dt);
         }
 
-        logStatus();
+        logData(currentTargetSpeed, gapFront);
+        logMatrix();
+
         pthread_mutex_unlock(&stateMutex);
-        usleep(50000); // 20Hz
+        usleep(50000);
     }
 }
+
 void TruckNode::cleanupOldNeighbors() {
     long now = time(nullptr);
     for (auto it = neighbors.begin(); it != neighbors.end(); ) {
-        // Change timeout from 10.0 to 1.0 or 1.5 seconds
-        if (difftime(now, it->second.timestamp) > 1.5) {
+        if (difftime(now, it->second.timestamp) > FAILURE_TIMEOUT) {
+            logEvent("NETWORK", "Lost connection to Truck " + std::to_string(it->first) + " (Timeout)");
             it = neighbors.erase(it);
         } else {
             ++it;
@@ -221,28 +237,29 @@ void TruckNode::cleanupOldNeighbors() {
     }
 }
 
-void TruckNode::logStatus() {
-    if (!logFile.is_open()) return;
+void TruckNode::logData(double targetSpeed, double gapFront) {
+    if (!dataLog.is_open()) return;
 
-    double mySpeed = physics.getSpeed();
-    logFile << "------------------------------------------------\n";
-    logFile << "TIME: " << time(nullptr) << "\n";
-    logFile << "[STATUS] T" << id << " Speed: " << (mySpeed * 3.6) << " km/h";
-    if (isJamming) logFile << " [JAMMED]";
-    logFile << "\n";
+    dataLog << std::fixed << std::setprecision(2)
+            << time(nullptr) << ","
+            << physics.getPosition() << ","
+            << (physics.getSpeed() * 3.6) << ","
+            << targetSpeed << ","
+            << gapFront << ","
+            << (isJamming ? "1" : "0") << ","
+            << (emergencyBrake ? "1" : "0") << "\n";
+}
 
-    logFile << "[MATRIX CLOCK]\n      ";
-    for(int k=0; k<MAX_NODES; k++) logFile << "T" << k << "  ";
-    logFile << "\n";
-
+void TruckNode::logMatrix() {
+    if (!matrixLog.is_open()) return;
+    matrixLog << "TIME: " << time(nullptr) << "\n";
     for(int i=0; i<MAX_NODES; i++) {
-        logFile << "Row " << i << ": ";
         for(int j=0; j<MAX_NODES; j++) {
-            logFile << std::setw(3) << myMatrix[i][j] << " ";
+            matrixLog << myMatrix[i][j] << " ";
         }
-        logFile << "\n";
+        matrixLog << "\n";
     }
-    logFile.flush();
+    matrixLog << "-----------------\n";
 }
 
 // Entry Points

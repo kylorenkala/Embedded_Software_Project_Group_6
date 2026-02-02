@@ -16,7 +16,13 @@ private:
     int id;
     int targetPlatoonSize = 1;
     double jammingTimer = 0.0;
-    std::ofstream logFile;
+
+    // --- UPDATED LOGGING STREAMS ---
+    std::ofstream eventLog;   // Text events
+    std::ofstream dataLog;    // CSV data
+    std::ofstream matrixLog;  // Matrix clock state
+    // -------------------------------
+
     int myMatrix[MAX_NODES][MAX_NODES];
 
     // Components
@@ -35,7 +41,12 @@ private:
 
     // Helpers
     void cleanupOldNeighbors();
-    void logStatus();
+
+    // --- NEW LOGGING HELPERS ---
+    void logEvent(std::string type, std::string desc);
+    void logData(double targetSpeed, double gapFront);
+    void logMatrix();
+    // ---------------------------
 
 public:
     TruckNode(int truckId);
@@ -44,9 +55,9 @@ public:
     void setTargetPlatoonSize(int size);
 
     // Main execution loops
-    void runLogic();         // The "Brain" Loop (Logic + Physics + OpenMP)
-    void runCommunication(); // The "Ear" Loop (UDP Sending/Receiving)
-    void runInput();         // The "Keyboard" Loop (User Fault Injection)
+    void runLogic();
+    void runCommunication();
+    void runInput();
 
     // Static entry points for pthreads
     static void* startComms(void* context);
