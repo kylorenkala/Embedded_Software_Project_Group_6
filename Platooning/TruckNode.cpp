@@ -212,8 +212,12 @@ void TruckNode::runLogic() {
 void TruckNode::cleanupOldNeighbors() {
     long now = time(nullptr);
     for (auto it = neighbors.begin(); it != neighbors.end(); ) {
-        if (difftime(now, it->second.timestamp) > 10.0) it = neighbors.erase(it);
-        else ++it;
+        // Change timeout from 10.0 to 1.0 or 1.5 seconds
+        if (difftime(now, it->second.timestamp) > 1.5) {
+            it = neighbors.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
