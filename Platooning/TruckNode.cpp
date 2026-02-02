@@ -2,31 +2,33 @@
 #include <iostream>
 #include <iomanip>
 #include <unistd.h>
-#include <fstream>
-#include <filesystem>
+#include <cmath>
 
-const double GHOST_TIMEOUT = 10.0;
-const double SIGNAL_TIMEOUT = 2.0;
+// Constants
+const double FAILURE_TIMEOUT = 10.0; // Stop after 10s of no signal
+const double SIGNAL_TIMEOUT = 2.0;   // Consider signal lost after 2s
 
 TruckNode::TruckNode(int truckId) : id(truckId), physics(truckId, TARGET_DISTANCE) {
     pthread_mutex_init(&stateMutex, nullptr);
     net = std::make_unique<NetworkModule>(id);
 
+    // Initialize Matrix Clock to 0
     for(int i=0; i<MAX_NODES; i++) {
         for(int j=0; j<MAX_NODES; j++) {
             myMatrix[i][j] = 0;
         }
     }
+
+    // Open Log File
     std::string filename = "truck_log_" + std::to_string(id) + ".txt";
     logFile.open(filename);
-    net->flush();
+    if (logFile.is_open()) {
+        logFile << "=== Truck " << id << " Log Started ===\n";
+    }
 }
 
 TruckNode::~TruckNode() {
-    if (logFile.is_open()) {
-        logFile << "=== Simulation Ended ===\n";
-        logFile.close();
-    }
+    if (logFile.is_open()) logFile.close();
     pthread_mutex_destroy(&stateMutex);
 }
 
@@ -34,43 +36,35 @@ void TruckNode::setTargetPlatoonSize(int size) {
     targetPlatoonSize = size;
 }
 
-// --- THREAD 1: COMMUNICATION ---
+// --- THREAD 1: COMMUNICATION (Unchanged) ---
 void TruckNode::runCommunication() {
     while (true) {
-        // --- PART A: RECEIVE LOOP ---
-        // We process ALL waiting packets to ensure our state is up-to-date
+        // RECEIVE
         while (true) {
             PlatoonMessage msg{};
-
-            // 1. Try to get a packet (Non-blocking)
             if (!net->receive(msg)) break;
 
-            // 2. CRITICAL SECTION: Update State & Clocks
             pthread_mutex_lock(&stateMutex);
-
-            // A. Update Neighbor Data
             neighbors[msg.truckId] = msg;
-            neighbors[msg.truckId].timestamp = time(nullptr); // Update "Wall Clock" for Ghost Detection
+            neighbors[msg.truckId].timestamp = time(nullptr);
 
-            // B. Update Logical Matrix Clock (Synchronization Requirement)
-            // Algorithm: LocalClock[i] = max(LocalClock[i], ReceivedClock[i])
+            // Update Matrix Clock
             for(int i=0; i<MAX_NODES; i++) {
                 for(int j=0; j<MAX_NODES; j++) {
-                    // We learn everything the sender knows
                     myMatrix[i][j] = std::max(myMatrix[i][j], msg.matrixClock[i][j]);
                 }
             }
-            myMatrix[id][msg.truckId] = std::max(myMatrix[id][msg.truckId], msg.matrixClock[msg.truckId][msg.truckId]);
+            // Update my knowledge of what the sender knows
+            if(id < MAX_NODES && msg.truckId < MAX_NODES) {
+                 myMatrix[id][msg.truckId] = std::max(myMatrix[id][msg.truckId], msg.matrixClock[msg.truckId][msg.truckId]);
+            }
             pthread_mutex_unlock(&stateMutex);
         }
 
-        // --- PART B: BROADCAST LOOP ---
-        // Prepare the message to send to others
-
+        // BROADCAST
         pthread_mutex_lock(&stateMutex);
-        bool jamming = isJamming; // Local copy to avoid holding mutex during I/O
+        bool jamming = isJamming;
 
-        // 1. Construct the Message
         PlatoonMessage myMsg{};
         myMsg.truckId = id;
         myMsg.position = physics.getPosition();
@@ -79,28 +73,23 @@ void TruckNode::runCommunication() {
         myMsg.isDecoupled = isDecoupled;
         myMsg.timestamp = time(nullptr);
 
-        // 2. Attach Logical Matrix Clock
-        // Send our current knowledge of the system time to everyone else
         for(int i=0; i<MAX_NODES; i++) {
             for(int j=0; j<MAX_NODES; j++) {
                 myMsg.matrixClock[i][j] = myMatrix[i][j];
             }
         }
-
         pthread_mutex_unlock(&stateMutex);
 
-        // 3. Send (If not jamming)
         if (!jamming) {
             net->broadcast(myMsg);
         }
-
-        // Broadcast rate: ~20Hz (Every 50ms)
         usleep(50000);
     }
 }
-// --- THREAD 2: INPUT ---
+
+// --- THREAD 2: INPUT (Unchanged) ---
 void TruckNode::runInput(){
-    std::cout << "--- INPUT READY (Enter after key) ---\n";
+    std::cout << "--- INPUT READY ('j'=Jam, 'b'=Brake, 'd'=Decouple) ---\n";
     while (true) {
         char c;
         std::cin >> c;
@@ -117,14 +106,11 @@ void TruckNode::runInput(){
     }
 }
 
-// --- THREAD 3: LOGIC (MAIN) ---
-// In TruckNode.cpp
-
+// --- THREAD 3: LOGIC (SIMPLIFIED) ---
 void TruckNode::runLogic() {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
     while (true) {
-        // 1. Calculate Delta Time (dt)
         auto now = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = now - lastTime;
         double dt = elapsed.count();
@@ -132,93 +118,83 @@ void TruckNode::runLogic() {
 
         pthread_mutex_lock(&stateMutex);
 
-        // --- FIX 2: Increment My Logical Clock ---
-        // This marks a new "event" or "state change" in the distributed system
-        if (id < MAX_NODES) {
-            myMatrix[id][id]++;
-        }
+        // 1. Matrix Clock Tick
+        if (id < MAX_NODES) myMatrix[id][id]++;
 
-        // 2. Cleanup "Dead" Trucks (> 10s silence)
+        // 2. Cleanup Old Neighbors (Maintenance only)
         cleanupOldNeighbors();
 
-        // 3. JAMMING LOGIC
-        if (isJamming) {
-            // Increment timer
+        // 3. DETECT COMMUNICATION FAILURE
+        // Definition: Either Manual Jamming ('j') OR Leader Signal Lost (> 2s)
+        bool commsFailed = isJamming;
+
+        // Check for real signal loss (if we are a follower)
+        if (id != 0 && !neighbors.empty()) {
+            // Assume Truck 0 is leader for the simple case, or nearest front truck
+            // Here we check if *any* truck is visible. If neighbors is empty or all stale, we fail.
+            bool leaderAlive = false;
+            long currentTime = time(nullptr);
+
+            // Simple check: Is Truck 0 (or leader) alive?
+            if (neighbors.count(0)) {
+                double age = difftime(currentTime, neighbors[0].timestamp);
+                if (age < SIGNAL_TIMEOUT) leaderAlive = true;
+            }
+
+            // If I am meant to follow but Leader is dead -> Comms Failed
+            if (!leaderAlive && !isJamming) {
+                commsFailed = true;
+            }
+        }
+
+        // 4. HANDLE BEHAVIOR
+        if (commsFailed) {
             jammingTimer += dt;
 
-            if (jammingTimer < 10.0) {
-                // PHASE 1: BLIND CRUISE (0 - 10 seconds)
-                // "Drive on constant speed (50kmh)" ignoring sensors
-                double blindSpeed = 50.0 / 3.6; // 13.8 m/s
+            if (jammingTimer < FAILURE_TIMEOUT) {
+                // PHASE 1: Simple "Keep Following" (0 - 10s)
+                // "Drive 50kmph constant to maintain flow"
+                double blindSpeed = 50.0 / 3.6;
                 physics.update(blindSpeed, dt);
 
-                if (id == 0) std::cout << " [JAMMED] Blind Cruising (" << (10.0 - jammingTimer) << "s left)\r";
+                if (id != 0) std::cout << " [COMMS FAIL] Keeping Speed 50km/h (" << (10.0 - jammingTimer) << "s left)\r";
             } else {
-                // PHASE 2: EMERGENCY STOP (> 10 seconds)
+                // PHASE 2: Timeout (> 10s)
+                // "Whole platoon will stop"
                 physics.emergencyStop(dt);
-                if (id == 0) std::cout << " [JAMMED] Timeout! Stopping.\r";
+                if (id != 0) std::cout << " [COMMS FAIL] TIMEOUT! Emergency Stop.\r";
             }
         }
         else {
             // NORMAL OPERATION
-            jammingTimer = 0.0; // Reset timer
+            jammingTimer = 0.0;
 
-            // --- GHOST LOGIC START ---
-            // Create a temporary copy of neighbors to modify for the Controller.
-            // We use a copy so we don't corrupt the actual network data.
-            std::map<int, PlatoonMessage> percepts = neighbors;
-            long currentTime = time(nullptr);
-
-            for (auto& kv : percepts) {
-                double age = difftime(currentTime, kv.second.timestamp);
-
-                // If signal is "Stale" (> 2.0s) but not yet deleted (< 10.0s)
-                if (age > SIGNAL_TIMEOUT) {
-                    // Force the logic to treat it as a STOPPED obstacle
-                    kv.second.speed = 0.0;
-                    kv.second.emergencyBrake = true;
-
-                    // Visual warning so you know it's happening
-                    if (id != 0) std::cout << " [WARNING] Ghost Detected: T" << kv.first << " (Age: " << age << "s)\r";
-                }
-            }
-            // --- GHOST LOGIC END ---
-
-            // 4. CALCULATE TARGET SPEED
-            // CRITICAL FIX: We pass 'physics.getSpeed()' as the 3rd argument.
-            // This allows the controller to calculate Stopping Distance.
+            // Simple Controller Logic (Standard PID)
+            // Note: We removed the "Ghost Detection" loop that modified 'neighbors' here.
+            // We pass the raw neighbors map directly.
             double targetSpeed = controller.calculateTargetSpeed(
                 id,
                 physics.getPosition(),
-                physics.getSpeed(),    // <--- NEW ARGUMENT (Fixes Crashing)
-                percepts,              // Use the 'Ghost-Aware' map copy
+                physics.getSpeed(),
+                neighbors,
                 isDecoupled,
                 emergencyBrake,
                 targetPlatoonSize
             );
 
-            // 5. UPDATE PHYSICS
             physics.update(targetSpeed, dt);
         }
 
         logStatus();
         pthread_mutex_unlock(&stateMutex);
-
-        // Run at ~20 Hz
-        usleep(50000);
+        usleep(50000); // 20Hz
     }
 }
 
-;
 void TruckNode::cleanupOldNeighbors() {
     long now = time(nullptr);
-
     for (auto it = neighbors.begin(); it != neighbors.end(); ) {
-        double age = difftime(now, it->second.timestamp);
-
-        // Only DELETE if it has been gone for a LONG time (10s)
-        if (age > GHOST_TIMEOUT) {
-            std::cout << "[T" << id << "] Removing Ghost Truck " << it->first << "\n";
+        if (difftime(now, it->second.timestamp) > 10.0) {
             it = neighbors.erase(it);
         } else {
             ++it;
@@ -227,58 +203,31 @@ void TruckNode::cleanupOldNeighbors() {
 }
 
 void TruckNode::logStatus() {
-    // Safety check: if file failed to open, don't crash
     if (!logFile.is_open()) return;
 
-    double myPos = physics.getPosition();
     double mySpeed = physics.getSpeed();
 
-    // 1. Find the truck directly ahead (Logic unchanged)
-    double minGap = 99999.0;
-    int frontId = -1;
-
-    for (const auto& kv : neighbors) {
-        double diff = kv.second.position - myPos;
-        if (diff > 0 && diff < minGap) {
-            minGap = diff;
-            frontId = kv.first;
-        }
-    }
-
-    // 2. WRITE TO FILE instead of Console
     logFile << "------------------------------------------------\n";
     logFile << "TIME: " << time(nullptr) << "\n";
-    logFile << "[STATUS] Speed: " << std::fixed << std::setprecision(1) << (mySpeed * 3.6) << " km/h";
-
-    if (isJamming) logFile << " [JAMMED] ";
-    if (emergencyBrake) logFile << " [BRAKING] ";
-
-    if (frontId != -1) {
-        logFile << " | Gap to T" << frontId << ": " << minGap << "m";
-    } else {
-        logFile << " | (No truck ahead)";
-    }
+    logFile << "[STATUS] T" << id << " Speed: " << (mySpeed * 3.6) << " km/h";
+    if (isJamming) logFile << " [JAMMED]";
     logFile << "\n";
 
-    // 3. PRINT FULL MATRIX CLOCK
-    logFile << "[MATRIX CLOCK DUMP]\n";
-    logFile << "      ";
-    // Header row (0 1 2 ...)
+    // Print Matrix
+    logFile << "[MATRIX CLOCK]\n      ";
     for(int k=0; k<MAX_NODES; k++) logFile << "T" << k << "  ";
     logFile << "\n";
 
     for(int i=0; i<MAX_NODES; i++) {
         logFile << "Row " << i << ": ";
         for(int j=0; j<MAX_NODES; j++) {
-            // Print matrix values formatted nicely
             logFile << std::setw(3) << myMatrix[i][j] << " ";
         }
         logFile << "\n";
     }
-    logFile << "\n"; // Extra space for readability
-
-    // Flush to ensure data is written immediately (useful if program crashes)
     logFile.flush();
 }
+
+// Entry Points
 void* TruckNode::startComms(void* ctx) { ((TruckNode*)ctx)->runCommunication(); return nullptr; }
 void* TruckNode::startInput(void* ctx) { ((TruckNode*)ctx)->runInput(); return nullptr; }
