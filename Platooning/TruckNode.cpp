@@ -3,6 +3,8 @@
 #include <iomanip>
 #include <unistd.h>
 #include <cmath>
+#include <vector>    // <--- REQUIRED FOR OPENMP
+#include <omp.h>     // <--- REQUIRED FOR OPENMP
 
 // Constants
 const double FAILURE_TIMEOUT = 10.0; // Stop after 10s of no signal
@@ -23,7 +25,7 @@ TruckNode::TruckNode(int truckId) : id(truckId), physics(truckId, TARGET_DISTANC
     std::string filename = "truck_log_" + std::to_string(id) + ".txt";
     logFile.open(filename);
     if (logFile.is_open()) {
-        logFile << "=== Truck " << id << " Log Started ===\n";
+        logFile << "=== Truck " << id << " Log Started (OpenMP Enabled) ===\n";
     }
 }
 
@@ -54,7 +56,6 @@ void TruckNode::runCommunication() {
                     myMatrix[i][j] = std::max(myMatrix[i][j], msg.matrixClock[i][j]);
                 }
             }
-            // Update my knowledge of what the sender knows
             if(id < MAX_NODES && msg.truckId < MAX_NODES) {
                  myMatrix[id][msg.truckId] = std::max(myMatrix[id][msg.truckId], msg.matrixClock[msg.truckId][msg.truckId]);
             }
@@ -106,7 +107,8 @@ void TruckNode::runInput(){
     }
 }
 
-// --- THREAD 3: LOGIC (SIMPLIFIED) ---
+// --- THREAD 3: LOGIC (OPENMP IMPLEMENTED) ---
+// --- THREAD 3: LOGIC (FIXED JAMMING SCENARIO) ---
 void TruckNode::runLogic() {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -121,67 +123,84 @@ void TruckNode::runLogic() {
         // 1. Matrix Clock Tick
         if (id < MAX_NODES) myMatrix[id][id]++;
 
-        // 2. Cleanup Old Neighbors (Maintenance only)
+        // 2. Cleanup Old Neighbors
         cleanupOldNeighbors();
 
-        // 3. DETECT COMMUNICATION FAILURE
-        // Definition: Either Manual Jamming ('j') OR Leader Signal Lost (> 2s)
-        bool commsFailed = isJamming;
-
-        // Check for real signal loss (if we are a follower)
-        if (id != 0 && !neighbors.empty()) {
-            // Assume Truck 0 is leader for the simple case, or nearest front truck
-            // Here we check if *any* truck is visible. If neighbors is empty or all stale, we fail.
-            bool leaderAlive = false;
-            long currentTime = time(nullptr);
-
-            // Simple check: Is Truck 0 (or leader) alive?
-            if (neighbors.count(0)) {
-                double age = difftime(currentTime, neighbors[0].timestamp);
-                if (age < SIGNAL_TIMEOUT) leaderAlive = true;
-            }
-
-            // If I am meant to follow but Leader is dead -> Comms Failed
-            if (!leaderAlive && !isJamming) {
-                commsFailed = true;
-            }
-        }
-
-        // 4. HANDLE BEHAVIOR
-        if (commsFailed) {
+        // 3. JAMMING / FAILURE CHECK
+        // We handle jamming FIRST because it overrides everything else.
+        if (isJamming) {
             jammingTimer += dt;
 
-            if (jammingTimer < FAILURE_TIMEOUT) {
-                // PHASE 1: Simple "Keep Following" (0 - 10s)
-                // "Drive 50kmph constant to maintain flow"
-                double blindSpeed = 50.0 / 3.6;
+            if (jammingTimer < 10.0) {
+                // PHASE 1: BLIND CRUISE (0 - 10 seconds)
+                // Requirement: "Keep driving for 10 seconds at 30m distance and at 50kmh"
+                // Since we are jammed, we cannot measure distance.
+                // We MUST assume that driving at 50km/h maintains the gap.
+
+                double blindSpeed = 50.0 / 3.6; // 13.8 m/s (50 km/h)
                 physics.update(blindSpeed, dt);
 
-                if (id != 0) std::cout << " [COMMS FAIL] Keeping Speed 50km/h (" << (10.0 - jammingTimer) << "s left)\r";
-            } else {
-                // PHASE 2: Timeout (> 10s)
-                // "Whole platoon will stop"
+                if (id != 0) std::cout << " [JAMMED] Blind Cruise (Time: " << std::fixed << std::setprecision(1) << jammingTimer << "s) - Speed: 50 km/h\r";
+            }
+            else {
+                // PHASE 2: EMERGENCY STOP (> 10 seconds)
+                // Requirement: "If comms doesn't restore, whole platoon stops"
                 physics.emergencyStop(dt);
-                if (id != 0) std::cout << " [COMMS FAIL] TIMEOUT! Emergency Stop.\r";
+                if (id != 0) std::cout << " [JAMMED] TIMEOUT! Emergency Stop.\r";
             }
         }
         else {
-            // NORMAL OPERATION
+            // NORMAL OPERATION (Comms Restored)
             jammingTimer = 0.0;
 
-            // Simple Controller Logic (Standard PID)
-            // Note: We removed the "Ghost Detection" loop that modified 'neighbors' here.
-            // We pass the raw neighbors map directly.
-            double targetSpeed = controller.calculateTargetSpeed(
-                id,
-                physics.getPosition(),
-                physics.getSpeed(),
-                neighbors,
-                isDecoupled,
-                emergencyBrake,
-                targetPlatoonSize
-            );
+            // --- OPENMP SENSOR FUSION START ---
+            std::vector<PlatoonMessage> sensorData;
+            std::vector<int> sensorIds;
 
+            // 1. Flatten Map to Vector for OpenMP
+            for (const auto& kv : neighbors) {
+                sensorData.push_back(kv.second);
+                sensorIds.push_back(kv.first);
+            }
+
+            int dataSize = sensorData.size();
+            long currentTime = time(nullptr);
+
+            // 2. Parallel Processing (OpenMP)
+            #pragma omp parallel for
+            for (int i = 0; i < dataSize; i++) {
+                double age = difftime(currentTime, sensorData[i].timestamp);
+
+                // Signal Timeout Logic (Ghost Detection)
+                if (age > SIGNAL_TIMEOUT) {
+                    // FIX: Only panic if the ghost is IN FRONT of us.
+                    // If the guy behind me disappears, I don't need to slam the brakes.
+                    double relativePos = sensorData[i].position - physics.getPosition();
+
+                    if (relativePos > 0) { // It is AHEAD of me
+                        sensorData[i].speed = 0.0;
+                        sensorData[i].emergencyBrake = true;
+                    }
+                    else {
+                        // It is BEHIND me. Ignore it for now so I don't stop.
+                        // (The 10s timeout in 'cleanupOldNeighbors' will handle it later)
+                    }
+                }
+            }
+
+            // 3. Reconstruct Map for Controller
+            std::map<int, PlatoonMessage> processedNeighbors;
+            for (int i = 0; i < dataSize; i++) {
+                processedNeighbors[sensorIds[i]] = sensorData[i];
+            }
+            // --- OPENMP SENSOR FUSION END ---
+
+            // 4. PID CONTROL
+            double targetSpeed = controller.calculateTargetSpeed(
+                id, physics.getPosition(), physics.getSpeed(),
+                processedNeighbors,
+                isDecoupled, emergencyBrake, targetPlatoonSize
+            );
             physics.update(targetSpeed, dt);
         }
 
@@ -190,15 +209,11 @@ void TruckNode::runLogic() {
         usleep(50000); // 20Hz
     }
 }
-
 void TruckNode::cleanupOldNeighbors() {
     long now = time(nullptr);
     for (auto it = neighbors.begin(); it != neighbors.end(); ) {
-        if (difftime(now, it->second.timestamp) > 10.0) {
-            it = neighbors.erase(it);
-        } else {
-            ++it;
-        }
+        if (difftime(now, it->second.timestamp) > 10.0) it = neighbors.erase(it);
+        else ++it;
     }
 }
 
@@ -206,14 +221,12 @@ void TruckNode::logStatus() {
     if (!logFile.is_open()) return;
 
     double mySpeed = physics.getSpeed();
-
     logFile << "------------------------------------------------\n";
     logFile << "TIME: " << time(nullptr) << "\n";
     logFile << "[STATUS] T" << id << " Speed: " << (mySpeed * 3.6) << " km/h";
     if (isJamming) logFile << " [JAMMED]";
     logFile << "\n";
 
-    // Print Matrix
     logFile << "[MATRIX CLOCK]\n      ";
     for(int k=0; k<MAX_NODES; k++) logFile << "T" << k << "  ";
     logFile << "\n";
