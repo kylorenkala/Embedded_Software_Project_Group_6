@@ -137,7 +137,9 @@ void TruckNode::runInput(){
     }
 }
 
-// --- THREAD 3: LOGIC (GPU ENABLED) ---
+// ... (previous code remains the same)
+
+// --- THREAD 3: LOGIC (BENCHMARK READY) ---
 void TruckNode::runLogic() {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -158,11 +160,13 @@ void TruckNode::runLogic() {
         if (isJamming) {
             jammingTimer += dt;
             if (jammingTimer < 10.0) {
+                // PHASE 1: BLIND CRUISE
                 double blindSpeed = 50.0 / 3.6;
                 physics.update(blindSpeed, dt);
                 currentTargetSpeed = blindSpeed;
                 if (id != 0) std::cout << " [JAMMED] Blind Cruise (" << std::fixed << std::setprecision(1) << jammingTimer << "s)\r";
             } else {
+                // PHASE 2: EMERGENCY STOP
                 physics.emergencyStop(dt);
                 currentTargetSpeed = 0.0;
                 if (id != 0) std::cout << " [JAMMED] TIMEOUT! Emergency Stop.\r";
@@ -174,7 +178,10 @@ void TruckNode::runLogic() {
             // NORMAL OPERATION
             jammingTimer = 0.0;
 
-            // 1. Prepare Data Vectors (Flatten the Map for GPU)
+            // =========================================================
+            //               STEP 1: PREPARE DATA
+            // =========================================================
+            // Flatten the map into vectors (Common for both CPU and GPU)
             std::vector<double> h_pos, h_spd, h_age;
             std::vector<int> h_ids;
             auto steadyNow = std::chrono::steady_clock::now();
@@ -184,7 +191,6 @@ void TruckNode::runLogic() {
                 h_pos.push_back(kv.second.position);
                 h_spd.push_back(kv.second.speed);
 
-                // Calculate precise age on CPU first
                 if (receptionTimes.count(kv.first)) {
                     h_age.push_back(std::chrono::duration<double>(steadyNow - receptionTimes[kv.first]).count());
                 } else {
@@ -192,22 +198,81 @@ void TruckNode::runLogic() {
                 }
             }
 
-            // 2. Run on GPU (OpenCL)
-            std::vector<double> out_pos, out_spd;
-            std::vector<int> out_brake;
+            // Output containers
+            std::vector<double> out_pos(h_pos.size()), out_spd(h_pos.size());
+            std::vector<int> out_brake(h_pos.size());
+
+            // =========================================================
+            //               STEP 2: STRESS TEST (THE EXPERIMENT)
+            // =========================================================
+            // We repeat the calculation 10,000 times to simulate a heavy load.
+            const int STRESS_ITERATIONS = 10000;
+
+            // Start Benchmark Timer
+            auto startBench = std::chrono::high_resolution_clock::now();
 
             if (!h_pos.empty()) {
-                gpu->runSensorFusion(h_pos, h_spd, h_age, out_pos, out_spd, out_brake,
-                                     physics.getPosition(), SIGNAL_TIMEOUT, FAILURE_TIMEOUT);
+
+                // -----------------------------------------------------
+                // OPTION A: GPU (OpenCL) - CURRENTLY ACTIVE
+                // -----------------------------------------------------
+                for (int k = 0; k < STRESS_ITERATIONS; k++) {
+                    gpu->runSensorFusion(h_pos, h_spd, h_age, out_pos, out_spd, out_brake,
+                                         physics.getPosition(), SIGNAL_TIMEOUT, FAILURE_TIMEOUT);
+                }
+
+                // -----------------------------------------------------
+                // OPTION B: CPU (OpenMP) - CURRENTLY COMMENTED OUT
+                // To test CPU: Comment out Option A, and Uncomment this block
+                // -----------------------------------------------------
+                /*
+                for (int k = 0; k < STRESS_ITERATIONS; k++) {
+                    // Reset outputs for fairness
+                    out_pos = h_pos;
+                    out_spd = h_spd;
+                    std::fill(out_brake.begin(), out_brake.end(), 0);
+
+                    #pragma omp parallel for
+                    for (size_t i = 0; i < h_pos.size(); i++) {
+                        double age = h_age[i];
+
+                        // 1. Position Extrapolation
+                        if (age > 0.0 && age < FAILURE_TIMEOUT) {
+                            out_pos[i] += (h_spd[i] * age);
+                        }
+
+                        // 2. Ghost Detection
+                        if (age > SIGNAL_TIMEOUT) {
+                            if ((out_pos[i] - physics.getPosition()) > 0) {
+                                out_spd[i] = 0.0;
+                                out_brake[i] = 1;
+                            }
+                        }
+                    }
+                }
+                */
             }
 
-            // 3. Map Results Back to Objects
+            // Stop Benchmark Timer
+            auto endBench = std::chrono::high_resolution_clock::now();
+            double duration_us = std::chrono::duration<double, std::micro>(endBench - startBench).count();
+
+            // Log Performance (Every 50 ticks)
+            static int logCounter = 0;
+            if (logCounter++ % 50 == 0 && !h_pos.empty()) {
+                 std::cout << "[BENCHMARK] Time for " << STRESS_ITERATIONS
+                           << " iterations: " << (int)duration_us << " microseconds" << std::endl;
+            }
+
+            // =========================================================
+            //               STEP 3: APPLY RESULTS
+            // =========================================================
             std::map<int, PlatoonMessage> processedNeighbors;
             for (size_t i = 0; i < h_pos.size(); i++) {
                 int tId = h_ids[i];
                 PlatoonMessage msg = neighbors[tId];
 
-                // Apply GPU results
+                // Apply the calculated physics (from the last iteration)
                 msg.position = out_pos[i];
                 msg.speed = out_spd[i];
                 if (out_brake[i] == 1) {
