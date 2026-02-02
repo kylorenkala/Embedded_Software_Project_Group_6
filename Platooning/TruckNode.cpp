@@ -11,6 +11,11 @@ TruckNode::TruckNode(int truckId)
 {
     pthread_mutex_init(&stateMutex, nullptr);
     net = std::make_unique<NetworkModule>(id);
+
+    for (int i = 0; i < MAX_NODES; i++) {
+        myClock[i] = 0;
+    }
+
     net->flush();
 }
 
@@ -23,39 +28,68 @@ void TruckNode::setTargetPlatoonSize(int size) {
 }
 
 // --- THREAD 1: COMMUNICATION ---
+// --- THREAD 1: COMMUNICATION ---
 void TruckNode::runCommunication() {
     while (true) {
-        // RECEIVE LOOP
+        // --- PART A: RECEIVE LOOP ---
+        // We process ALL waiting packets to ensure our state is up-to-date
         while (true) {
             PlatoonMessage msg{};
 
-            // 1. Check if packet exists
+            // 1. Try to get a packet (Non-blocking)
             if (!net->receive(msg)) break;
 
-            // 2. Debug Print (You added this)
-            //std::cout << "DEBUG: Received msg from Truck " << msg.truckId << "\n";
-
-            // 3. SAVE THE MESSAGE (CRITICAL STEP)
+            // 2. CRITICAL SECTION: Update State & Clocks
             pthread_mutex_lock(&stateMutex);
-            neighbors[msg.truckId] = msg;                     // <--- MUST BE HERE
-            neighbors[msg.truckId].timestamp = time(nullptr); // <--- MUST BE HERE
+
+            // A. Update Neighbor Data
+            neighbors[msg.truckId] = msg;
+            neighbors[msg.truckId].timestamp = time(nullptr); // Update "Wall Clock" for Ghost Detection
+
+            // B. Update Logical Matrix Clock (Synchronization Requirement)
+            // Algorithm: LocalClock[i] = max(LocalClock[i], ReceivedClock[i])
+            for (int i = 0; i < MAX_NODES; i++) {
+                // We update our known history of the system based on the sender's history
+                if (i < MAX_NODES) {
+                    myClock[i] = std::max(myClock[i], msg.matrixClock[i]);
+                }
+            }
+
             pthread_mutex_unlock(&stateMutex);
         }
 
-        // BROADCAST
+        // --- PART B: BROADCAST LOOP ---
+        // Prepare the message to send to others
+
         pthread_mutex_lock(&stateMutex);
-        bool jamming = isJamming;
-        // Construct message from Physics component
-        PlatoonMessage myMsg{id, physics.getPosition(), physics.getSpeed(), emergencyBrake, isDecoupled, (long)time(nullptr)};
+        bool jamming = isJamming; // Local copy to avoid holding mutex during I/O
+
+        // 1. Construct the Message
+        PlatoonMessage myMsg{};
+        myMsg.truckId = id;
+        myMsg.position = physics.getPosition();
+        myMsg.speed = physics.getSpeed();
+        myMsg.emergencyBrake = emergencyBrake;
+        myMsg.isDecoupled = isDecoupled;
+        myMsg.timestamp = time(nullptr);
+
+        // 2. Attach Logical Matrix Clock
+        // Send our current knowledge of the system time to everyone else
+        for (int i = 0; i < MAX_NODES; i++) {
+            myMsg.matrixClock[i] = myClock[i];
+        }
+
         pthread_mutex_unlock(&stateMutex);
 
+        // 3. Send (If not jamming)
         if (!jamming) {
             net->broadcast(myMsg);
         }
+
+        // Broadcast rate: ~20Hz (Every 50ms)
         usleep(50000);
     }
 }
-
 // --- THREAD 2: INPUT ---
 void TruckNode::runInput() {
     std::cout << "--- INPUT READY (Enter after key) ---\n";
@@ -89,6 +123,12 @@ void TruckNode::runLogic() {
         lastTime = now;
 
         pthread_mutex_lock(&stateMutex);
+
+        // --- FIX 2: Increment My Logical Clock ---
+        // This marks a new "event" or "state change" in the distributed system
+        if (id < MAX_NODES) {
+            myClock[id]++;
+        }
 
         // 2. Cleanup "Dead" Trucks (> 10s silence)
         cleanupOldNeighbors();
@@ -179,7 +219,7 @@ void TruckNode::cleanupOldNeighbors() {
 }
 
 void TruckNode::logStatus() {
-    if (id == 0) return; // Leader usually doesn't need to spam logs
+    if (id == 0) return;
 
     double myPos = physics.getPosition();
     double mySpeed = physics.getSpeed();
@@ -190,13 +230,11 @@ void TruckNode::logStatus() {
 
     for (const auto& kv : neighbors) {
         double diff = kv.second.position - myPos;
-
-        // We only care about trucks IN FRONT (diff > 0)
-        // and we want the CLOSEST one (diff < minGap)
         if (diff > 0 && diff < minGap) {
             minGap = diff;
             frontId = kv.first;
         }
+        // REMOVED THE CLOCK PRINT FROM HERE
     }
 
     // 2. Print Status
@@ -211,7 +249,14 @@ void TruckNode::logStatus() {
         std::cout << " | (No truck ahead)";
     }
     std::cout << "\n";
-}
-// --- THREAD ENTRY POINTS ---
+
+    // --- FIX 3: Print Clock ONCE at the end ---
+    std::cout << " [CLOCK]: [";
+    for(int i=0; i<4; i++) {
+        std::cout << myClock[i] << " ";
+    }
+    std::cout << "]\n";
+    // ------------------------------------------
+}// --- THREAD ENTRY POINTS ---
 void* TruckNode::startComms(void* ctx) { ((TruckNode*)ctx)->runCommunication(); return nullptr; }
 void* TruckNode::startInput(void* ctx) { ((TruckNode*)ctx)->runInput(); return nullptr; }

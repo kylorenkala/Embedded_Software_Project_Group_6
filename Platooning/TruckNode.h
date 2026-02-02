@@ -4,15 +4,22 @@
 #include <memory>
 #include <pthread.h>
 #include <chrono>
+#include <map>
+#include <vector>
 #include "network_module.h"
 #include "VehiclePhysics.h"
 #include "PlatoonController.h"
+#include "common.h" // Required for MAX_NODES constant
 
 class TruckNode {
 private:
     int id;
     int targetPlatoonSize = 1;
     double jammingTimer = 0.0;
+
+    // --- REQUIREMENT: LOGICAL MATRIX CLOCK ---
+    // Stores the vector clock state for this node
+    int myClock[MAX_NODES];
 
     // Components
     std::unique_ptr<NetworkModule> net;
@@ -24,7 +31,7 @@ private:
     bool isDecoupled = false;
     bool isJamming = false;
 
-    // Threading
+    // Threading & Data
     std::map<int, PlatoonMessage> neighbors;
     pthread_mutex_t stateMutex;
 
@@ -37,11 +44,11 @@ public:
     ~TruckNode();
 
     void setTargetPlatoonSize(int size);
-    
+
     // Main execution loops
-    void runLogic();         // The "Brain" Loop
-    void runCommunication(); // The "Ear" Loop
-    void runInput();         // The "Keyboard" Loop
+    void runLogic();         // The "Brain" Loop (Logic + Physics + OpenMP)
+    void runCommunication(); // The "Ear" Loop (UDP Sending/Receiving)
+    void runInput();         // The "Keyboard" Loop (User Fault Injection)
 
     // Static entry points for pthreads
     static void* startComms(void* context);
