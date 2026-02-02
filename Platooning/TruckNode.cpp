@@ -2,24 +2,31 @@
 #include <iostream>
 #include <iomanip>
 #include <unistd.h>
+#include <fstream>
+#include <filesystem>
 
 const double GHOST_TIMEOUT = 10.0;
 const double SIGNAL_TIMEOUT = 2.0;
 
-TruckNode::TruckNode(int truckId)
-    : id(truckId), physics(truckId, TARGET_DISTANCE)
-{
+TruckNode::TruckNode(int truckId) : id(truckId), physics(truckId, TARGET_DISTANCE) {
     pthread_mutex_init(&stateMutex, nullptr);
     net = std::make_unique<NetworkModule>(id);
 
-    for (int i = 0; i < MAX_NODES; i++) {
-        myClock[i] = 0;
+    for(int i=0; i<MAX_NODES; i++) {
+        for(int j=0; j<MAX_NODES; j++) {
+            myMatrix[i][j] = 0;
+        }
     }
-
+    std::string filename = "truck_log_" + std::to_string(id) + ".txt";
+    logFile.open(filename);
     net->flush();
 }
 
 TruckNode::~TruckNode() {
+    if (logFile.is_open()) {
+        logFile << "=== Simulation Ended ===\n";
+        logFile.close();
+    }
     pthread_mutex_destroy(&stateMutex);
 }
 
@@ -27,7 +34,6 @@ void TruckNode::setTargetPlatoonSize(int size) {
     targetPlatoonSize = size;
 }
 
-// --- THREAD 1: COMMUNICATION ---
 // --- THREAD 1: COMMUNICATION ---
 void TruckNode::runCommunication() {
     while (true) {
@@ -48,13 +54,13 @@ void TruckNode::runCommunication() {
 
             // B. Update Logical Matrix Clock (Synchronization Requirement)
             // Algorithm: LocalClock[i] = max(LocalClock[i], ReceivedClock[i])
-            for (int i = 0; i < MAX_NODES; i++) {
-                // We update our known history of the system based on the sender's history
-                if (i < MAX_NODES) {
-                    myClock[i] = std::max(myClock[i], msg.matrixClock[i]);
+            for(int i=0; i<MAX_NODES; i++) {
+                for(int j=0; j<MAX_NODES; j++) {
+                    // We learn everything the sender knows
+                    myMatrix[i][j] = std::max(myMatrix[i][j], msg.matrixClock[i][j]);
                 }
             }
-
+            myMatrix[id][msg.truckId] = std::max(myMatrix[id][msg.truckId], msg.matrixClock[msg.truckId][msg.truckId]);
             pthread_mutex_unlock(&stateMutex);
         }
 
@@ -75,8 +81,10 @@ void TruckNode::runCommunication() {
 
         // 2. Attach Logical Matrix Clock
         // Send our current knowledge of the system time to everyone else
-        for (int i = 0; i < MAX_NODES; i++) {
-            myMsg.matrixClock[i] = myClock[i];
+        for(int i=0; i<MAX_NODES; i++) {
+            for(int j=0; j<MAX_NODES; j++) {
+                myMsg.matrixClock[i][j] = myMatrix[i][j];
+            }
         }
 
         pthread_mutex_unlock(&stateMutex);
@@ -91,7 +99,7 @@ void TruckNode::runCommunication() {
     }
 }
 // --- THREAD 2: INPUT ---
-void TruckNode::runInput() {
+void TruckNode::runInput(){
     std::cout << "--- INPUT READY (Enter after key) ---\n";
     while (true) {
         char c;
@@ -127,7 +135,7 @@ void TruckNode::runLogic() {
         // --- FIX 2: Increment My Logical Clock ---
         // This marks a new "event" or "state change" in the distributed system
         if (id < MAX_NODES) {
-            myClock[id]++;
+            myMatrix[id][id]++;
         }
 
         // 2. Cleanup "Dead" Trucks (> 10s silence)
@@ -219,12 +227,13 @@ void TruckNode::cleanupOldNeighbors() {
 }
 
 void TruckNode::logStatus() {
-    if (id == 0) return;
+    // Safety check: if file failed to open, don't crash
+    if (!logFile.is_open()) return;
 
     double myPos = physics.getPosition();
     double mySpeed = physics.getSpeed();
 
-    // 1. Find the truck directly ahead
+    // 1. Find the truck directly ahead (Logic unchanged)
     double minGap = 99999.0;
     int frontId = -1;
 
@@ -234,29 +243,42 @@ void TruckNode::logStatus() {
             minGap = diff;
             frontId = kv.first;
         }
-        // REMOVED THE CLOCK PRINT FROM HERE
     }
 
-    // 2. Print Status
-    std::cout << "[T" << id << "] ";
-    if (isJamming) std::cout << "(NO SIGNAL) ";
+    // 2. WRITE TO FILE instead of Console
+    logFile << "------------------------------------------------\n";
+    logFile << "TIME: " << time(nullptr) << "\n";
+    logFile << "[STATUS] Speed: " << std::fixed << std::setprecision(1) << (mySpeed * 3.6) << " km/h";
 
-    std::cout << "Speed: " << std::fixed << std::setprecision(1) << (mySpeed * 3.6) << " km/h";
+    if (isJamming) logFile << " [JAMMED] ";
+    if (emergencyBrake) logFile << " [BRAKING] ";
 
     if (frontId != -1) {
-        std::cout << " | Gap to T" << frontId << ": " << minGap << "m";
+        logFile << " | Gap to T" << frontId << ": " << minGap << "m";
     } else {
-        std::cout << " | (No truck ahead)";
+        logFile << " | (No truck ahead)";
     }
-    std::cout << "\n";
+    logFile << "\n";
 
-    // --- FIX 3: Print Clock ONCE at the end ---
-    std::cout << " [CLOCK]: [";
-    for(int i=0; i<4; i++) {
-        std::cout << myClock[i] << " ";
+    // 3. PRINT FULL MATRIX CLOCK
+    logFile << "[MATRIX CLOCK DUMP]\n";
+    logFile << "      ";
+    // Header row (0 1 2 ...)
+    for(int k=0; k<MAX_NODES; k++) logFile << "T" << k << "  ";
+    logFile << "\n";
+
+    for(int i=0; i<MAX_NODES; i++) {
+        logFile << "Row " << i << ": ";
+        for(int j=0; j<MAX_NODES; j++) {
+            // Print matrix values formatted nicely
+            logFile << std::setw(3) << myMatrix[i][j] << " ";
+        }
+        logFile << "\n";
     }
-    std::cout << "]\n";
-    // ------------------------------------------
-}// --- THREAD ENTRY POINTS ---
+    logFile << "\n"; // Extra space for readability
+
+    // Flush to ensure data is written immediately (useful if program crashes)
+    logFile.flush();
+}
 void* TruckNode::startComms(void* ctx) { ((TruckNode*)ctx)->runCommunication(); return nullptr; }
 void* TruckNode::startInput(void* ctx) { ((TruckNode*)ctx)->runInput(); return nullptr; }

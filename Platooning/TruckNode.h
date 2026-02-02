@@ -4,22 +4,20 @@
 #include <memory>
 #include <pthread.h>
 #include <chrono>
-#include <map>
-#include <vector>
+#include <fstream>
+#include <string>
 #include "network_module.h"
 #include "VehiclePhysics.h"
 #include "PlatoonController.h"
-#include "common.h" // Required for MAX_NODES constant
+#include "common.h"
 
 class TruckNode {
 private:
     int id;
     int targetPlatoonSize = 1;
     double jammingTimer = 0.0;
-
-    // --- REQUIREMENT: LOGICAL MATRIX CLOCK ---
-    // Stores the vector clock state for this node
-    int myClock[MAX_NODES];
+    std::ofstream logFile;
+    int myMatrix[MAX_NODES][MAX_NODES];
 
     // Components
     std::unique_ptr<NetworkModule> net;
