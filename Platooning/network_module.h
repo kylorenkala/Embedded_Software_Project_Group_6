@@ -77,7 +77,7 @@ public:
     }
 
     void broadcast(const PlatoonMessage& msg) {
-        for(int i=0; i<5; i++) {
+        for(int i=0; i<MAX_NODES; i++) {
             broadcastAddr.sin_port = htons(PORT_BASE + i);
             if (i != msg.truckId) {
                 sendto(sockfd, (const char*)&msg, sizeof(msg), 0, (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
