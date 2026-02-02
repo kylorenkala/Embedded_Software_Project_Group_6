@@ -15,13 +15,17 @@ TruckNode::TruckNode(int truckId) : id(truckId), physics(truckId, TARGET_DISTANC
     pthread_mutex_init(&stateMutex, nullptr);
     net = std::make_unique<NetworkModule>(id);
 
+    // Initialize Matrix Clock
     for(int i=0; i<MAX_NODES; i++) {
         for(int j=0; j<MAX_NODES; j++) {
             myMatrix[i][j] = 0;
         }
     }
 
-    // LOGGING SETUP
+    // Initialize GPU
+    gpu = std::make_unique<GpuHandler>();
+
+    // Logging
     eventLog.open("truck_events_" + std::to_string(id) + ".txt");
     if (eventLog.is_open()) {
         eventLog << "=== Truck " << id << " Event Log ===\n";
@@ -65,11 +69,10 @@ void TruckNode::runCommunication() {
 
             pthread_mutex_lock(&stateMutex);
             neighbors[msg.truckId] = msg;
-            neighbors[msg.truckId].timestamp = time(nullptr); // Keep for legacy compatibility
+            neighbors[msg.truckId].timestamp = time(nullptr);
 
-            // --- FIX: RECORD PRECISE RECEPTION TIME ---
+            // Record precise reception time
             receptionTimes[msg.truckId] = std::chrono::steady_clock::now();
-            // ------------------------------------------
 
             for(int i=0; i<MAX_NODES; i++) {
                 for(int j=0; j<MAX_NODES; j++) {
@@ -134,7 +137,7 @@ void TruckNode::runInput(){
     }
 }
 
-// --- THREAD 3: LOGIC ---
+// --- THREAD 3: LOGIC (GPU ENABLED) ---
 void TruckNode::runLogic() {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -168,63 +171,59 @@ void TruckNode::runLogic() {
                 }
             }
         } else {
+            // NORMAL OPERATION
             jammingTimer = 0.0;
 
-            // --- PREPARE DATA FOR OPENMP ---
-            std::vector<PlatoonMessage> sensorData;
-            std::vector<int> sensorIds;
-            std::vector<double> preciseAges; // New Vector for smooth ages
-
-            // Capture the current precise time for age calculation
+            // 1. Prepare Data Vectors (Flatten the Map for GPU)
+            std::vector<double> h_pos, h_spd, h_age;
+            std::vector<int> h_ids;
             auto steadyNow = std::chrono::steady_clock::now();
 
             for (const auto& kv : neighbors) {
-                sensorData.push_back(kv.second);
-                sensorIds.push_back(kv.first);
+                h_ids.push_back(kv.first);
+                h_pos.push_back(kv.second.position);
+                h_spd.push_back(kv.second.speed);
 
-                // --- CALCULATE PRECISE AGE ---
-                // Calculate age in floating-point seconds (e.g., 0.123s)
+                // Calculate precise age on CPU first
                 if (receptionTimes.count(kv.first)) {
-                    double age = std::chrono::duration<double>(steadyNow - receptionTimes[kv.first]).count();
-                    preciseAges.push_back(age);
+                    h_age.push_back(std::chrono::duration<double>(steadyNow - receptionTimes[kv.first]).count());
                 } else {
-                    preciseAges.push_back(0.0);
+                    h_age.push_back(0.0);
                 }
             }
 
-            int dataSize = sensorData.size();
+            // 2. Run on GPU (OpenCL)
+            std::vector<double> out_pos, out_spd;
+            std::vector<int> out_brake;
 
-            #pragma omp parallel for
-            for (int i = 0; i < dataSize; i++) {
-                // Use the precise age we calculated earlier
-                double age = preciseAges[i];
-
-                // --- FIX: SMOOTH POSITION EXTRAPOLATION ---
-                // Now using high-precision age, so the ghost moves smoothly
-                if (age > 0.0 && age < FAILURE_TIMEOUT) {
-                    sensorData[i].position += (sensorData[i].speed * age);
-                }
-
-                if (age > SIGNAL_TIMEOUT) {
-                    double relativePos = sensorData[i].position - physics.getPosition();
-                    if (relativePos > 0) {
-                        sensorData[i].speed = 0.0;
-                        sensorData[i].emergencyBrake = true;
-                    }
-                }
+            if (!h_pos.empty()) {
+                gpu->runSensorFusion(h_pos, h_spd, h_age, out_pos, out_spd, out_brake,
+                                     physics.getPosition(), SIGNAL_TIMEOUT, FAILURE_TIMEOUT);
             }
 
+            // 3. Map Results Back to Objects
             std::map<int, PlatoonMessage> processedNeighbors;
-            for (int i = 0; i < dataSize; i++) {
-                processedNeighbors[sensorIds[i]] = sensorData[i];
-                if (sensorIds[i] != id) {
-                    double dist = sensorData[i].position - physics.getPosition();
-                    if (dist > 0 && (gapFront < 0 || dist < gapFront)) {
-                        gapFront = dist;
-                    }
+            for (size_t i = 0; i < h_pos.size(); i++) {
+                int tId = h_ids[i];
+                PlatoonMessage msg = neighbors[tId];
+
+                // Apply GPU results
+                msg.position = out_pos[i];
+                msg.speed = out_spd[i];
+                if (out_brake[i] == 1) {
+                    msg.emergencyBrake = true;
+                }
+
+                processedNeighbors[tId] = msg;
+
+                // Gap logging calculation
+                if (tId != id) {
+                    double dist = msg.position - physics.getPosition();
+                    if (dist > 0 && (gapFront < 0 || dist < gapFront)) gapFront = dist;
                 }
             }
 
+            // 4. Run Controller
             double targetSpeed = controller.calculateTargetSpeed(
                 id, physics.getPosition(), physics.getSpeed(),
                 processedNeighbors, isDecoupled, emergencyBrake, targetPlatoonSize
@@ -243,12 +242,10 @@ void TruckNode::runLogic() {
 }
 
 void TruckNode::cleanupOldNeighbors() {
-    // We still use the coarse time for cleanup as 1s precision is fine for deletion
     long now = time(nullptr);
     for (auto it = neighbors.begin(); it != neighbors.end(); ) {
         if (difftime(now, it->second.timestamp) > FAILURE_TIMEOUT) {
             logEvent("NETWORK", "Lost connection to Truck " + std::to_string(it->first) + " (Timeout)");
-            // Clean up the reception time map as well to prevent memory leaks
             receptionTimes.erase(it->first);
             it = neighbors.erase(it);
         } else {
