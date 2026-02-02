@@ -134,7 +134,9 @@ void TruckNode::runInput(){
     }
 }
 
-// --- THREAD 3: LOGIC ---
+// ... (previous code remains the same)
+
+// --- THREAD 3: LOGIC (BENCHMARK READY) ---
 void TruckNode::runLogic() {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -155,11 +157,13 @@ void TruckNode::runLogic() {
         if (isJamming) {
             jammingTimer += dt;
             if (jammingTimer < 10.0) {
+                // PHASE 1: BLIND CRUISE
                 double blindSpeed = 50.0 / 3.6;
                 physics.update(blindSpeed, dt);
                 currentTargetSpeed = blindSpeed;
                 if (id != 0) std::cout << " [JAMMED] Blind Cruise (" << std::fixed << std::setprecision(1) << jammingTimer << "s)\r";
             } else {
+                // PHASE 2: EMERGENCY STOP
                 physics.emergencyStop(dt);
                 currentTargetSpeed = 0.0;
                 if (id != 0) std::cout << " [JAMMED] TIMEOUT! Emergency Stop.\r";
@@ -168,63 +172,120 @@ void TruckNode::runLogic() {
                 }
             }
         } else {
+            // NORMAL OPERATION
             jammingTimer = 0.0;
 
-            // --- PREPARE DATA FOR OPENMP ---
-            std::vector<PlatoonMessage> sensorData;
-            std::vector<int> sensorIds;
-            std::vector<double> preciseAges; // New Vector for smooth ages
-
-            // Capture the current precise time for age calculation
+            // =========================================================
+            //               STEP 1: PREPARE DATA
+            // =========================================================
+            // Flatten the map into vectors (Common for both CPU and GPU)
+            std::vector<double> h_pos, h_spd, h_age;
+            std::vector<int> h_ids;
             auto steadyNow = std::chrono::steady_clock::now();
 
             for (const auto& kv : neighbors) {
-                sensorData.push_back(kv.second);
-                sensorIds.push_back(kv.first);
+                h_ids.push_back(kv.first);
+                h_pos.push_back(kv.second.position);
+                h_spd.push_back(kv.second.speed);
 
-                // --- CALCULATE PRECISE AGE ---
-                // Calculate age in floating-point seconds (e.g., 0.123s)
                 if (receptionTimes.count(kv.first)) {
-                    double age = std::chrono::duration<double>(steadyNow - receptionTimes[kv.first]).count();
-                    preciseAges.push_back(age);
+                    h_age.push_back(std::chrono::duration<double>(steadyNow - receptionTimes[kv.first]).count());
                 } else {
-                    preciseAges.push_back(0.0);
+                    h_age.push_back(0.0);
                 }
             }
 
-            int dataSize = sensorData.size();
+            // Output containers
+            std::vector<double> out_pos(h_pos.size()), out_spd(h_pos.size());
+            std::vector<int> out_brake(h_pos.size());
 
-            #pragma omp parallel for
-            for (int i = 0; i < dataSize; i++) {
-                // Use the precise age we calculated earlier
-                double age = preciseAges[i];
+            // =========================================================
+            //               STEP 2: STRESS TEST (THE EXPERIMENT)
+            // =========================================================
+            // We repeat the calculation 10,000 times to simulate a heavy load.
+            const int STRESS_ITERATIONS = 10000;
 
-                // --- FIX: SMOOTH POSITION EXTRAPOLATION ---
-                // Now using high-precision age, so the ghost moves smoothly
-                if (age > 0.0 && age < FAILURE_TIMEOUT) {
-                    sensorData[i].position += (sensorData[i].speed * age);
-                }
+            // Start Benchmark Timer
+            auto startBench = std::chrono::high_resolution_clock::now();
 
-                if (age > SIGNAL_TIMEOUT) {
-                    double relativePos = sensorData[i].position - physics.getPosition();
-                    if (relativePos > 0) {
-                        sensorData[i].speed = 0.0;
-                        sensorData[i].emergencyBrake = true;
+            if (!h_pos.empty()) {
+
+                // -----------------------------------------------------
+                // OPTION A: GPU (OpenCL) - CURRENTLY ACTIVE
+                // -----------------------------------------------------
+                /*for (int k = 0; k < STRESS_ITERATIONS; k++) {
+                    gpu->runSensorFusion(h_pos, h_spd, h_age, out_pos, out_spd, out_brake,
+                                         physics.getPosition(), SIGNAL_TIMEOUT, FAILURE_TIMEOUT);
+                }*/
+
+                // -----------------------------------------------------
+                // OPTION B: CPU (OpenMP) - CURRENTLY COMMENTED OUT
+                // To test CPU: Comment out Option A, and Uncomment this block
+                // -----------------------------------------------------
+
+                for (int k = 0; k < STRESS_ITERATIONS; k++) {
+                    // Reset outputs for fairness
+                    out_pos = h_pos;
+                    out_spd = h_spd;
+                    std::fill(out_brake.begin(), out_brake.end(), 0);
+
+                    #pragma omp parallel for
+                    for (size_t i = 0; i < h_pos.size(); i++) {
+                        double age = h_age[i];
+
+                        // 1. Position Extrapolation
+                        if (age > 0.0 && age < FAILURE_TIMEOUT) {
+                            out_pos[i] += (h_spd[i] * age);
+                        }
+
+                        // 2. Ghost Detection
+                        if (age > SIGNAL_TIMEOUT) {
+                            if ((out_pos[i] - physics.getPosition()) > 0) {
+                                out_spd[i] = 0.0;
+                                out_brake[i] = 1;
+                            }
+                        }
                     }
                 }
+
             }
 
+            // Stop Benchmark Timer
+            auto endBench = std::chrono::high_resolution_clock::now();
+            double duration_us = std::chrono::duration<double, std::micro>(endBench - startBench).count();
+
+            // Log Performance (Every 50 ticks)
+            static int logCounter = 0;
+            if (logCounter++ % 50 == 0 && !h_pos.empty()) {
+                 std::cout << "[BENCHMARK] Time for " << STRESS_ITERATIONS
+                           << " iterations: " << (int)duration_us << " microseconds" << std::endl;
+            }
+
+            // =========================================================
+            //               STEP 3: APPLY RESULTS
+            // =========================================================
             std::map<int, PlatoonMessage> processedNeighbors;
-            for (int i = 0; i < dataSize; i++) {
-                processedNeighbors[sensorIds[i]] = sensorData[i];
-                if (sensorIds[i] != id) {
-                    double dist = sensorData[i].position - physics.getPosition();
-                    if (dist > 0 && (gapFront < 0 || dist < gapFront)) {
-                        gapFront = dist;
-                    }
+            for (size_t i = 0; i < h_pos.size(); i++) {
+                int tId = h_ids[i];
+                PlatoonMessage msg = neighbors[tId];
+
+                // Apply the calculated physics (from the last iteration)
+                msg.position = out_pos[i];
+                msg.speed = out_spd[i];
+                if (out_brake[i] == 1) {
+                    msg.emergencyBrake = true;
+                }
+
+                processedNeighbors[tId] = msg;
+
+                // Gap logging calculation
+                if (tId != id) {
+                    double dist = msg.position - physics.getPosition();
+                    if (dist > 0 && (gapFront < 0 || dist < gapFront)) gapFront = dist;
                 }
             }
 
+            // 4. Run Controller
             double targetSpeed = controller.calculateTargetSpeed(
                 id, physics.getPosition(), physics.getSpeed(),
                 processedNeighbors, isDecoupled, emergencyBrake, targetPlatoonSize
