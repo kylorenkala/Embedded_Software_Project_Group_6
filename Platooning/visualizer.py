@@ -3,12 +3,12 @@ import socket
 import struct
 import time
 
-# --- CONFIGURATION ---
+# --- MINI-CONFIGURATION ---
 UDP_IP = "0.0.0.0"
 UDP_PORT = 4999
-METERS_TO_PIXELS = 12.0   
-TRUCK_WIDTH = 100         
-TRUCK_HEIGHT = 40
+METERS_TO_PIXELS = 6.0    # Scale: 6 pixels per meter
+TRUCK_WIDTH = 50          # Visual length of the truck
+TRUCK_HEIGHT = 20         # Visual height
 TIMEOUT = 2.0             
 
 # --- NETWORK SETUP ---
@@ -20,181 +20,166 @@ trucks = {}
 
 def parse_packet(data):
     try:
-        # Old format: i 4x d d ? 3x l
-        # New format: i 4x d d ? ? 2x l  (Two bools: Brake, Decoupled)
-        
-        # Check for the new larger packet size (approx 33-40 bytes depending on packing)
         if len(data) >= 32:
-             # Try unpacking with 2 bools
-             try:
-                 # i=4, d=8, d=8, ?=1, ?=1, pad=2, l=8 => Total 32 bytes
-                 # We simply add another '?' for the decoupled flag
-                 unpacked = struct.unpack('i 4x d d ? ? 2x l', data[0:32])
-                 return unpacked[0], unpacked[1], unpacked[2], unpacked[3], unpacked[5] # Return ID, Pos, Spd, Brake, Time
-             except:
-                 # Fallback to old format if something goes wrong
-                 return struct.unpack('i 4x d d ? 3x l', data[0:32])
-    except:
-        return None
+            unpacked = struct.unpack('i 4x d d ? ? 2x l', data[0:32])
+            return unpacked[0], unpacked[1], unpacked[2], unpacked[3], unpacked[4], unpacked[5]
+    except Exception as e:
+        print(f"Unpack error: {e}")
     return None
 
 class PlatoonVisualizer:
     def __init__(self, root):
         self.root = root
-        self.root.title("🚛 Distributed Platoon Simulation")
+        self.root.title("DPS Driving Simulator")
         
-        # --- 1. SET YOUR CUSTOM SIZE HERE ---
-        # Change these numbers to whatever you want!
-        # Examples: 800x600, 1280x720, 1000x500
-        WINDOW_WIDTH = 1900
-        WINDOW_HEIGHT = 600
+        # Window size
+        self.width = 800
+        self.height = 250
+        self.canvas = tk.Canvas(root, width=self.width, height=self.height, bg="#1a1a1a")
+        self.canvas.pack()
         
-        self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
+        # Road Background
+        self.road_y_top = 100
+        self.road_y_bot = 150
+        self.cy = 125  # Center of road
+
+        self.update()
+
+    def draw_moving_road(self, leader_pos_meters):
+        """ Draws dashed lines that scroll backward to simulate speed """
+        self.canvas.create_rectangle(0, self.road_y_top, self.width, self.road_y_bot, fill="#333", outline="")
         
-        # --- 2. DISABLE FULLSCREEN ---
-        # Comment this line out by adding a # at the start
-        # self.root.attributes("-fullscreen", True) 
-
-        self.root.bind("<Escape>", self.close_fullscreen)
-
-        # --- 3. TELL THE LOGIC YOUR NEW SIZE ---
-        # We manually set these so the drawing code knows where the center is
-        self.screen_w = WINDOW_WIDTH
-        self.screen_h = WINDOW_HEIGHT
-
-        # ... (Rest of the code remains the same) ...
-        self.canvas = tk.Canvas(root, bg="#222222", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.smooth_distances = {} 
-        self.update_simulation()
-
-    def close_fullscreen(self, event=None):
-        self.root.attributes("-fullscreen", False)
-        self.root.quit()
-
-    def draw_obstacle(self, x, y):
-        w = 30
-        h = 120
-        self.canvas.create_rectangle(x, y - h/2, x + w, y + h/2, fill="#AA4444", outline="white", width=3)
-        for i in range(0, 120, 20):
-            sy = (y - h/2) + i
-            self.canvas.create_line(x, sy, x + w, sy + 15, fill="black", width=4)
-        self.canvas.create_text(x + 15, y - h/2 - 25, text="OBSTACLE", fill="red", font=("Arial", 14, "bold"))
-
-    def draw_truck(self, x, y, color, truck_id, speed, braking, position):
-        trailer_w = TRUCK_WIDTH * 0.7
-        cabin_w = TRUCK_WIDTH * 0.25
-        self.canvas.create_rectangle(x - TRUCK_WIDTH, y - TRUCK_HEIGHT/2, x - TRUCK_WIDTH + trailer_w, y + TRUCK_HEIGHT/2, fill=color, outline="white", width=3)
-        cabin_x = x - TRUCK_WIDTH + trailer_w + 4
-        self.canvas.create_rectangle(cabin_x, y - TRUCK_HEIGHT/2 + 8, cabin_x + cabin_w, y + TRUCK_HEIGHT/2, fill=color, outline="white", width=3)
+        dash_len = 20
+        gap_len = 20
+        pattern_len = dash_len + gap_len
         
-        wheel_r = 8
-        wheel_y = y + TRUCK_HEIGHT/2
-        self.canvas.create_oval(x - TRUCK_WIDTH + 15, wheel_y - wheel_r, x - TRUCK_WIDTH + 15 + wheel_r*2, wheel_y + wheel_r, fill="black")
-        self.canvas.create_oval(x - TRUCK_WIDTH + 55, wheel_y - wheel_r, x - TRUCK_WIDTH + 55 + wheel_r*2, wheel_y + wheel_r, fill="black")
-        self.canvas.create_oval(cabin_x + 10, wheel_y - wheel_r, cabin_x + 10 + wheel_r*2, wheel_y + wheel_r, fill="black")
+        # Shift LEFT as position increases
+        shift = (leader_pos_meters * METERS_TO_PIXELS) % pattern_len
+        
+        start_x = -shift 
+        while start_x < self.width:
+            self.canvas.create_line(start_x, self.cy, start_x + dash_len, self.cy, 
+                                    fill="white", width=2, tags="road_lines")
+            start_x += pattern_len
 
-        if braking:
-            self.canvas.create_oval(x - TRUCK_WIDTH - 8, y - 15, x - TRUCK_WIDTH + 8, y + 15, fill="#FF0000", outline="#FF5555", width=2)
+    def draw_truck(self, x, y, color, label):
+        """ Draws the custom truck shape """
+        w = TRUCK_WIDTH
+        h = TRUCK_HEIGHT
+        
+        trailer_w = w * 0.65
+        cab_w = w * 0.25
+        gap = w * 0.05
+        
+        left_edge = x - (w / 2)
+        right_edge = x + (w / 2)
+        
+        # 1. Trailer
+        self.canvas.create_rectangle(
+            left_edge, y - h/2, 
+            left_edge + trailer_w, y + h/2 - 4, 
+            fill=color, outline="white", width=1, tags="truck_data"
+        )
+        
+        # 2. Cab
+        cab_x1 = left_edge + trailer_w + gap
+        cab_x2 = right_edge
+        self.canvas.create_polygon(
+            cab_x1, y + h/2 - 4, cab_x1, y - h/2 + 4, 
+            cab_x1 + 5, y - h/2, cab_x2, y - h/2, 
+            cab_x2, y + h/2 - 4,
+            fill=color, outline="white", width=1, tags="truck_data"
+        )
+        
+        # 3. Window
+        self.canvas.create_rectangle(cab_x1 + 8, y - h/2 + 2, cab_x2 - 2, y - h/4, fill="#87CEEB", outline="", tags="truck_data")
+        
+        # 4. Wheels
+        wheel_r = 4
+        wheel_y = y + h/2 - 2
+        for wx in [left_edge + 5, left_edge + trailer_w - 10, cab_x2 - 12]:
+            self.canvas.create_oval(wx, wheel_y - wheel_r, wx + 2*wheel_r, wheel_y + wheel_r, fill="black", outline="gray", tags="truck_data")
 
-        spd_kmh = int(speed * 3.6)
-        self.canvas.create_text(x - TRUCK_WIDTH, y - 45, text=f"ID:{truck_id} | {spd_kmh} km/h", fill="white", anchor="w", font=("Arial", 12, "bold"))
-        self.canvas.create_text(x - TRUCK_WIDTH, y - 70, text=f"Dist: {abs(position):.1f} m", fill="#00FFFF", anchor="w", font=("Arial", 11))
+        # 5. Label (Moved up to y - 35 to fit 2 lines)
+        self.canvas.create_text(x, y - 35, text=label, fill="white", font=("Arial", 8, "bold"), justify="center", tags="truck_data")
 
-    def update_simulation(self):
-        try:
-            while True:
+    def update(self):
+        # 1. Receive Data
+        while True:
+            try:
                 data, addr = sock.recvfrom(1024)
                 parsed = parse_packet(data)
                 if parsed:
-                    t_id, pos, spd, brake, ts = parsed
-                    trucks[t_id] = {'pos': pos, 'spd': spd, 'brake': brake, 'ts': time.time()}
-        except BlockingIOError: pass
+                    t_id, pos, spd, brake, decoupled, ts = parsed
+                    trucks[t_id] = {
+                        'pos': pos, 'spd': spd, 'brake': brake, 
+                        'decoupled': decoupled, 'last_seen': time.time()
+                    }
+            except BlockingIOError:
+                break
 
-        self.canvas.delete("all")
-        cy = self.screen_h / 2
+        # 2. Clear Screen
+        self.canvas.delete("truck_data")
+        self.canvas.delete("road_lines") 
+        
         now = time.time()
+        active_trucks = []
+        for t_id, t in list(trucks.items()):
+            if now - t['last_seen'] < TIMEOUT:
+                active_trucks.append((t_id, t['pos']))
         
-        leader_id = 0
-        if 0 not in trucks and trucks: leader_id = max(trucks.keys())
-        
-        truck_visuals = {}
-        for t_id, t in trucks.items():
-            dt = now - t['ts']
-            if dt > 0.5: dt = 0.0 
-            predicted_pos = t['pos'] + (t['spd'] * dt)
-            truck_visuals[t_id] = predicted_pos
+        active_trucks.sort(key=lambda x: x[1], reverse=True)
 
-        camera_focus_pos = 0
-        if leader_id in trucks and leader_id in truck_visuals:
-            camera_focus_pos = truck_visuals[leader_id]
-
-        scroll_offset = (camera_focus_pos * METERS_TO_PIXELS) % 150 
-        for x in range(0, self.screen_w + 150, 150):
-            draw_x = x - scroll_offset
-            self.canvas.create_rectangle(draw_x, cy - 4, draw_x+60, cy + 4, fill="white", outline="")
+        # 3. Draw Scene
+        if active_trucks:
+            leader_pos = active_trucks[0][1]
             
-        self.canvas.create_line(0, cy - 80, self.screen_w, cy - 80, fill="gray", width=5)
-        self.canvas.create_line(0, cy + 80, self.screen_w, cy + 80, fill="gray", width=5)
-
-        if not trucks:
-            self.canvas.create_text(self.screen_w/2, cy - 100, text="Waiting for Platoon...", fill="white", font=("Arial", 24))
-        else:
-            screen_focus_x = self.screen_w * 0.8  
+            # Animate Road
+            self.draw_moving_road(leader_pos)
             
-            if 0 in trucks and trucks[0]['brake']:
-                obstacle_dist = 20.0 
-                obs_pixel_x = screen_focus_x + (obstacle_dist * METERS_TO_PIXELS)
-                self.draw_obstacle(obs_pixel_x, cy)
+            # Camera Focus: 75% to the right
+            screen_focus_x = 600  
+            camera_offset = leader_pos 
 
-            # --- SORT BY POSITION (Descending) ---
-            # This ensures we connect lines based on who is actually physically ahead
-            active_trucks = []
-            for tid, t in trucks.items():
-                if now - t['ts'] < TIMEOUT:
-                    active_trucks.append((tid, truck_visuals[tid]))
-            
-            # Sort: Largest Position (Front) -> Smallest Position (Back)
-            active_trucks.sort(key=lambda x: x[1], reverse=True)
-
-            for i, (t_id, visual_pos) in enumerate(active_trucks):
+            for i, (t_id, pos) in enumerate(active_trucks):
                 t = trucks[t_id]
-                relative_pos = visual_pos - camera_focus_pos
-                pixel_x = screen_focus_x + (relative_pos * METERS_TO_PIXELS)
+                rel_pos = pos - camera_offset
+                pixel_x = screen_focus_x + (rel_pos * METERS_TO_PIXELS)
 
-                if -200 < pixel_x < self.screen_w + 200:
-                    color = "#44AAFF"
-                    if t['brake']: color = "#FF2222"
-                    if t_id == 0: color = "#FFAA00"
+                # Color Coding
+                color = "#00BFFF" 
+                if t['decoupled']: color = "#FFA500"
+                if t['brake']: color = "#FF4500"
+                if t_id == 0: color = "#32CD32"
 
-                    self.draw_truck(pixel_x, cy, color, t_id, t['spd'], t['brake'], visual_pos)
+                # --- UPDATED LABEL ---
+                # Added '\nDist: ...m' to show distance
+                label = f"T{t_id}: {t['spd']*3.6:.0f} km/h\nDist: {t['pos']:.1f} m"
+                
+                self.draw_truck(pixel_x, self.cy, color, label)
 
-                    # Connect to the truck physically in front (index i-1)
-                    if i > 0: 
-                        pred_id = active_trucks[i-1][0]
-                        pred_visual_pos = active_trucks[i-1][1]
-                            
-                        # Smoothing
-                        raw_dist = pred_visual_pos - visual_pos
-                        if t_id not in self.smooth_distances:
-                            self.smooth_distances[t_id] = raw_dist
-                        else:
-                            self.smooth_distances[t_id] = (self.smooth_distances[t_id] * 0.9) + (raw_dist * 0.1)
-                        final_dist = self.smooth_distances[t_id]
+                # Distance Lines
+                if i > 0:
+                    prev_pos = active_trucks[i-1][1]
+                    dist = prev_pos - pos
+                    prev_pixel_x = screen_focus_x + ((prev_pos - camera_offset) * METERS_TO_PIXELS)
+                    
+                    start_line = pixel_x + (TRUCK_WIDTH/2)
+                    end_line = prev_pixel_x - (TRUCK_WIDTH/2)
+                    
+                    if end_line > start_line:
+                        self.canvas.create_line(start_line, self.cy + 10, end_line, self.cy + 10, 
+                                                fill="yellow", dash=(2, 2), tags="truck_data")
+                        self.canvas.create_text((start_line + end_line)/2, self.cy + 20, 
+                                                text=f"{dist:.1f}m", fill="yellow", font=("Arial", 7), tags="truck_data")
+        else:
+            self.draw_moving_road(0)
+            self.canvas.create_text(400, 50, text="Waiting for Platoon...", fill="white", tags="truck_data")
 
-                        # Draw Line
-                        pred_rel = pred_visual_pos - camera_focus_pos
-                        pred_px = screen_focus_x + (pred_rel * METERS_TO_PIXELS)
-                        lx1 = pixel_x
-                        lx2 = pred_px - TRUCK_WIDTH
-                        
-                        if lx2 > lx1:
-                            self.canvas.create_line(lx1, cy, lx2, cy, fill="#FFFF00", width=3, dash=(8, 4))
-                            self.canvas.create_text((lx1+lx2)/2, cy + 40, text=f"{final_dist:.1f}m", fill="#FFFF00", font=("Arial", 12))
-
-        self.root.after(16, self.update_simulation)
+        self.root.after(40, self.update) 
 
 if __name__ == "__main__":
     root = tk.Tk()
+    root.attributes('-topmost', True) 
     app = PlatoonVisualizer(root)
     root.mainloop()
