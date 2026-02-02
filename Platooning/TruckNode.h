@@ -6,6 +6,7 @@
 #include <chrono>
 #include <fstream>
 #include <string>
+#include <map>
 #include "network_module.h"
 #include "VehiclePhysics.h"
 #include "PlatoonController.h"
@@ -17,11 +18,10 @@ private:
     int targetPlatoonSize = 1;
     double jammingTimer = 0.0;
 
-    // --- UPDATED LOGGING STREAMS ---
-    std::ofstream eventLog;   // Text events
-    std::ofstream dataLog;    // CSV data
-    std::ofstream matrixLog;  // Matrix clock state
-    // -------------------------------
+    // Logging Streams
+    std::ofstream eventLog;
+    std::ofstream dataLog;
+    std::ofstream matrixLog;
 
     int myMatrix[MAX_NODES][MAX_NODES];
 
@@ -37,16 +37,19 @@ private:
 
     // Threading & Data
     std::map<int, PlatoonMessage> neighbors;
+
+    // --- FIX: HIGH PRECISION TIMING MAP ---
+    // Stores the exact system time we received the last packet
+    std::map<int, std::chrono::steady_clock::time_point> receptionTimes;
+    // --------------------------------------
+
     pthread_mutex_t stateMutex;
 
     // Helpers
     void cleanupOldNeighbors();
-
-    // --- NEW LOGGING HELPERS ---
     void logEvent(std::string type, std::string desc);
     void logData(double targetSpeed, double gapFront);
     void logMatrix();
-    // ---------------------------
 
 public:
     TruckNode(int truckId);
@@ -54,12 +57,10 @@ public:
 
     void setTargetPlatoonSize(int size);
 
-    // Main execution loops
     void runLogic();
     void runCommunication();
     void runInput();
 
-    // Static entry points for pthreads
     static void* startComms(void* context);
     static void* startInput(void* context);
 };

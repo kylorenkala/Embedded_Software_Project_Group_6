@@ -65,7 +65,11 @@ void TruckNode::runCommunication() {
 
             pthread_mutex_lock(&stateMutex);
             neighbors[msg.truckId] = msg;
-            neighbors[msg.truckId].timestamp = time(nullptr);
+            neighbors[msg.truckId].timestamp = time(nullptr); // Keep for legacy compatibility
+
+            // --- FIX: RECORD PRECISE RECEPTION TIME ---
+            receptionTimes[msg.truckId] = std::chrono::steady_clock::now();
+            // ------------------------------------------
 
             for(int i=0; i<MAX_NODES; i++) {
                 for(int j=0; j<MAX_NODES; j++) {
@@ -166,27 +170,40 @@ void TruckNode::runLogic() {
         } else {
             jammingTimer = 0.0;
 
+            // --- PREPARE DATA FOR OPENMP ---
             std::vector<PlatoonMessage> sensorData;
             std::vector<int> sensorIds;
+            std::vector<double> preciseAges; // New Vector for smooth ages
+
+            // Capture the current precise time for age calculation
+            auto steadyNow = std::chrono::steady_clock::now();
+
             for (const auto& kv : neighbors) {
                 sensorData.push_back(kv.second);
                 sensorIds.push_back(kv.first);
+
+                // --- CALCULATE PRECISE AGE ---
+                // Calculate age in floating-point seconds (e.g., 0.123s)
+                if (receptionTimes.count(kv.first)) {
+                    double age = std::chrono::duration<double>(steadyNow - receptionTimes[kv.first]).count();
+                    preciseAges.push_back(age);
+                } else {
+                    preciseAges.push_back(0.0);
+                }
             }
 
             int dataSize = sensorData.size();
-            long currentTime = time(nullptr);
 
             #pragma omp parallel for
             for (int i = 0; i < dataSize; i++) {
-                double age = difftime(currentTime, sensorData[i].timestamp);
+                // Use the precise age we calculated earlier
+                double age = preciseAges[i];
 
-                // --- THE FIX: POSITION EXTRAPOLATION ---
-                // If data is slightly old but valid (<10s), assume the truck kept moving.
-                // This prevents us from braking for a "frozen ghost" during temporary packet loss.
+                // --- FIX: SMOOTH POSITION EXTRAPOLATION ---
+                // Now using high-precision age, so the ghost moves smoothly
                 if (age > 0.0 && age < FAILURE_TIMEOUT) {
                     sensorData[i].position += (sensorData[i].speed * age);
                 }
-                // ---------------------------------------
 
                 if (age > SIGNAL_TIMEOUT) {
                     double relativePos = sensorData[i].position - physics.getPosition();
@@ -226,10 +243,13 @@ void TruckNode::runLogic() {
 }
 
 void TruckNode::cleanupOldNeighbors() {
+    // We still use the coarse time for cleanup as 1s precision is fine for deletion
     long now = time(nullptr);
     for (auto it = neighbors.begin(); it != neighbors.end(); ) {
         if (difftime(now, it->second.timestamp) > FAILURE_TIMEOUT) {
             logEvent("NETWORK", "Lost connection to Truck " + std::to_string(it->first) + " (Timeout)");
+            // Clean up the reception time map as well to prevent memory leaks
+            receptionTimes.erase(it->first);
             it = neighbors.erase(it);
         } else {
             ++it;
