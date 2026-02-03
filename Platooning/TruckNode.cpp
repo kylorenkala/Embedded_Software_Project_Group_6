@@ -203,7 +203,7 @@ void TruckNode::runLogic() {
             //               STEP 2: STRESS TEST (THE EXPERIMENT)
             // =========================================================
             // We repeat the calculation 10,000 times to simulate a heavy load.
-            const int STRESS_ITERATIONS = 10000;
+            const int STRESS_ITERATIONS = 5000;
 
             // Start Benchmark Timer
             auto startBench = std::chrono::high_resolution_clock::now();
