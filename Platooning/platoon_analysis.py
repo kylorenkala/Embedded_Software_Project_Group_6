@@ -1,88 +1,110 @@
 import numpy as np
 from pycpa import model, analysis
 
-# --------------------------------
-# Helper: compute timing statistics
-# --------------------------------
+# ==============================
+# CONFIGURATION
+# ==============================
+
+INCLUDE_INPUT_TASK = True        # ← toggle this
+LOGIC_PERIOD = 50e-3             # 50 ms
+COMMS_PERIOD = 50e-3             # 50 ms
+INPUT_MIN_INTERARRIVAL = 100e-3  # 100 ms (conservative)
+
+# ==============================
+# STATISTICS FUNCTION
+# ==============================
+
 def timing_stats(samples_us):
     samples = np.array(samples_us)
-
-    stats = {
+    return {
         "min": np.min(samples),
         "median": np.median(samples),
         "p95": np.percentile(samples, 95),
         "p99": np.percentile(samples, 99),
-        "max": np.max(samples)
+        "max": np.max(samples),
     }
-    return stats
 
+def print_stats(name, stats):
+    print(f"{name} timing:")
+    print(f"min   = {stats['min']:.0f} µs")
+    print(f"median= {stats['median']:.0f} µs")
+    print(f"P95   = {stats['p95']:.0f} µs")
+    print(f"P99   = {stats['p99']:.0f} µs")
+    print(f"max   = {stats['max']:.0f} µs\n")
 
-# --------------------------------
-# Load measurement data (µs)
-# --------------------------------
-logic_samples_us = np.loadtxt("logic_times_us.txt")
-comms_samples_us = np.loadtxt("comms_times_us.txt")
+# ==============================
+# LOAD MEASUREMENTS
+# ==============================
 
-logic_stats = timing_stats(logic_samples_us)
-comms_stats = timing_stats(comms_samples_us)
+logic_samples = np.loadtxt("logic_times_us.txt")
+comms_samples = np.loadtxt("comms_times_us.txt")
 
-# --------------------------------
-# Print statistics (as requested)
-# --------------------------------
-print("Logic task timing:")
-print(f"min   = {logic_stats['min']:.0f} µs")
-print(f"median= {logic_stats['median']:.0f} µs")
-print(f"P95   = {logic_stats['p95']:.0f} µs")
-print(f"P99   = {logic_stats['p99']:.0f} µs")
-print(f"max   = {logic_stats['max']:.0f} µs\n")
+logic_stats = timing_stats(logic_samples)
+comms_stats = timing_stats(comms_samples)
 
-print("Comms task timing:")
-print(f"min   = {comms_stats['min']:.0f} µs")
-print(f"median= {comms_stats['median']:.0f} µs")
-print(f"P95   = {comms_stats['p95']:.0f} µs")
-print(f"P99   = {comms_stats['p99']:.0f} µs")
-print(f"max   = {comms_stats['max']:.0f} µs\n")
+print_stats("Logic", logic_stats)
+print_stats("Comms", comms_stats)
 
-# --------------------------------
-# Use MAX as WCET (engineering WCET)
-# --------------------------------
-WCET_logic = logic_stats["max"] * 1e-6   # seconds
-WCET_comms = comms_stats["max"] * 1e-6   # seconds
+if INCLUDE_INPUT_TASK:
+    input_samples = np.loadtxt("input_times_us.txt")
+    input_stats = timing_stats(input_samples)
+    print_stats("Input", input_stats)
 
-PERIOD = 50e-3  # 50 ms
+# ==============================
+# WCET (use MAX)
+# ==============================
 
-# --------------------------------
-# pyCPA system model
-# --------------------------------
+WCET_logic = logic_stats["max"] * 1e-6
+WCET_comms = comms_stats["max"] * 1e-6
+WCET_input = input_stats["max"] * 1e-6 if INCLUDE_INPUT_TASK else None
+
+# ==============================
+# pyCPA MODEL
+# ==============================
+
 system = model.System()
 cpu = model.Resource("CPU")
 system.bind_resource(cpu)
 
+# ---- Logic Task (periodic) ----
 logic = model.Task(
     name="Logic",
     wcet=WCET_logic,
-    period=PERIOD
+    period=LOGIC_PERIOD
 )
+logic.priority = 2
 logic.bind_resource(cpu)
-logic.priority = 1
+system.add_task(logic)
 
+# ---- Communication Task (periodic) ----
 comms = model.Task(
     name="Comms",
     wcet=WCET_comms,
-    period=PERIOD
+    period=COMMS_PERIOD
 )
+comms.priority = 2
 comms.bind_resource(cpu)
-comms.priority = 1
-
-system.add_task(logic)
 system.add_task(comms)
 
-# --------------------------------
-# Response-Time Analysis
-# --------------------------------
+# ---- Input Task (sporadic, optional) ----
+if INCLUDE_INPUT_TASK:
+    input_task = model.Task(
+        name="Input",
+        wcet=WCET_input,
+        period=INPUT_MIN_INTERARRIVAL  # sporadic modeled as min inter-arrival
+    )
+    input_task.priority = 1  # lowest priority
+    input_task.bind_resource(cpu)
+    system.add_task(input_task)
+
+# ==============================
+# RESPONSE-TIME ANALYSIS
+# ==============================
+
 rta = analysis.ResponseTimeAnalysis()
 
 print("=== pyCPA Results ===\n")
+
 total_util = 0.0
 
 for task in system.tasks:
