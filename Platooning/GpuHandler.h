@@ -5,8 +5,8 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
+#include <algorithm> // For std::transform
 
-// FIX: Define OpenCL version to silence warnings
 #define CL_TARGET_OPENCL_VERSION 300
 
 #ifdef __APPLE__
@@ -21,6 +21,8 @@ private:
     cl_command_queue queue;
     cl_program program;
     cl_kernel kernel;
+
+    // GPU Buffers (Now sized for float)
     cl_mem d_pos, d_spd, d_age, d_outPos, d_outSpeed, d_outBrake;
     size_t maxDataSize;
 
@@ -56,7 +58,6 @@ public:
 
         context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
 
-        // Use the older API to ensure compatibility, ignoring deprecation warnings
         #pragma GCC diagnostic push
         #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         queue = clCreateCommandQueue(context, device, 0, &err);
@@ -83,14 +84,15 @@ public:
 
         kernel = clCreateKernel(program, "sensorFusion", &err);
 
-        size_t dSize = maxDataSize * sizeof(double);
+        // --- ALLOCATE BUFFERS AS FLOAT (sizeof(float)) ---
+        size_t fSize = maxDataSize * sizeof(float);
         size_t iSize = maxDataSize * sizeof(int);
 
-        d_pos = clCreateBuffer(context, CL_MEM_READ_ONLY, dSize, NULL, NULL);
-        d_spd = clCreateBuffer(context, CL_MEM_READ_ONLY, dSize, NULL, NULL);
-        d_age = clCreateBuffer(context, CL_MEM_READ_ONLY, dSize, NULL, NULL);
-        d_outPos = clCreateBuffer(context, CL_MEM_WRITE_ONLY, dSize, NULL, NULL);
-        d_outSpeed = clCreateBuffer(context, CL_MEM_WRITE_ONLY, dSize, NULL, NULL);
+        d_pos = clCreateBuffer(context, CL_MEM_READ_ONLY, fSize, NULL, NULL);
+        d_spd = clCreateBuffer(context, CL_MEM_READ_ONLY, fSize, NULL, NULL);
+        d_age = clCreateBuffer(context, CL_MEM_READ_ONLY, fSize, NULL, NULL);
+        d_outPos = clCreateBuffer(context, CL_MEM_WRITE_ONLY, fSize, NULL, NULL);
+        d_outSpeed = clCreateBuffer(context, CL_MEM_WRITE_ONLY, fSize, NULL, NULL);
         d_outBrake = clCreateBuffer(context, CL_MEM_WRITE_ONLY, iSize, NULL, NULL);
     }
 
@@ -107,12 +109,22 @@ public:
         int n = h_pos.size();
         if(n == 0) return;
 
-        size_t dSize = n * sizeof(double);
+        // --- CONVERT DOUBLE TO FLOAT ---
+        std::vector<float> f_pos(h_pos.begin(), h_pos.end());
+        std::vector<float> f_spd(h_spd.begin(), h_spd.end());
+        std::vector<float> f_age(h_age.begin(), h_age.end());
+
+        float f_myPos = (float)myPos;
+        float f_sigTimeout = (float)sigTimeout;
+        float f_failTimeout = (float)failTimeout;
+
+        size_t fSize = n * sizeof(float);
         size_t iSize = n * sizeof(int);
 
-        clEnqueueWriteBuffer(queue, d_pos, CL_TRUE, 0, dSize, h_pos.data(), 0, NULL, NULL);
-        clEnqueueWriteBuffer(queue, d_spd, CL_TRUE, 0, dSize, h_spd.data(), 0, NULL, NULL);
-        clEnqueueWriteBuffer(queue, d_age, CL_TRUE, 0, dSize, h_age.data(), 0, NULL, NULL);
+        // Write Float Buffers
+        clEnqueueWriteBuffer(queue, d_pos, CL_TRUE, 0, fSize, f_pos.data(), 0, NULL, NULL);
+        clEnqueueWriteBuffer(queue, d_spd, CL_TRUE, 0, fSize, f_spd.data(), 0, NULL, NULL);
+        clEnqueueWriteBuffer(queue, d_age, CL_TRUE, 0, fSize, f_age.data(), 0, NULL, NULL);
 
         clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_pos);
         clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_spd);
@@ -121,17 +133,25 @@ public:
         clSetKernelArg(kernel, 4, sizeof(cl_mem), &d_outSpeed);
         clSetKernelArg(kernel, 5, sizeof(cl_mem), &d_outBrake);
         clSetKernelArg(kernel, 6, sizeof(int), &n);
-        clSetKernelArg(kernel, 7, sizeof(double), &myPos);
-        clSetKernelArg(kernel, 8, sizeof(double), &sigTimeout);
-        clSetKernelArg(kernel, 9, sizeof(double), &failTimeout);
+        clSetKernelArg(kernel, 7, sizeof(float), &f_myPos);         // Pass float
+        clSetKernelArg(kernel, 8, sizeof(float), &f_sigTimeout);    // Pass float
+        clSetKernelArg(kernel, 9, sizeof(float), &f_failTimeout);   // Pass float
 
         size_t globalSize = n;
         clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
 
-        out_pos.resize(n); out_spd.resize(n); out_brake.resize(n);
-        clEnqueueReadBuffer(queue, d_outPos, CL_TRUE, 0, dSize, out_pos.data(), 0, NULL, NULL);
-        clEnqueueReadBuffer(queue, d_outSpeed, CL_TRUE, 0, dSize, out_spd.data(), 0, NULL, NULL);
+        // Read Back Floats
+        std::vector<float> f_outPos(n);
+        std::vector<float> f_outSpeed(n);
+        out_brake.resize(n);
+
+        clEnqueueReadBuffer(queue, d_outPos, CL_TRUE, 0, fSize, f_outPos.data(), 0, NULL, NULL);
+        clEnqueueReadBuffer(queue, d_outSpeed, CL_TRUE, 0, fSize, f_outSpeed.data(), 0, NULL, NULL);
         clEnqueueReadBuffer(queue, d_outBrake, CL_TRUE, 0, iSize, out_brake.data(), 0, NULL, NULL);
+
+        // --- CONVERT FLOAT BACK TO DOUBLE ---
+        out_pos.assign(f_outPos.begin(), f_outPos.end());
+        out_spd.assign(f_outSpeed.begin(), f_outSpeed.end());
     }
 };
 

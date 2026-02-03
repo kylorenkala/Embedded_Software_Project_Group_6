@@ -1,45 +1,42 @@
 // File: fusion.cl
-// This code runs on the GPU.
+// Uses FLOAT (32-bit) for compatibility with Intel Iris Xe
 
 __kernel void sensorFusion(
-    __global const double* positions,
-    __global const double* speeds,
-    __global const double* ages,
-    __global double* outPos,
-    __global double* outSpeed,
+    __global const float* positions,   // Changed to float
+    __global const float* speeds,      // Changed to float
+    __global const float* ages,        // Changed to float
+    __global float* outPos,            // Changed to float
+    __global float* outSpeed,          // Changed to float
     __global int* outBrake,
     int numNeighbors,
-    double myPos,
-    double signalTimeout,
-    double failureTimeout
+    float myPos,                       // Changed to float
+    float signalTimeout,               // Changed to float
+    float failureTimeout               // Changed to float
 ) {
-    // Get unique ID for this thread (0, 1, 2, ...)
     int i = get_global_id(0);
 
-    // Boundary check
     if (i < numNeighbors) {
-        double age = ages[i];
-        double currentPos = positions[i];
-        double currentSpeed = speeds[i];
+        float age = ages[i];
+        float currentPos = positions[i];
+        float currentSpeed = speeds[i];
 
-        // 1. Position Extrapolation (Predict where neighbor is now)
-        if (age > 0.0 && age < failureTimeout) {
+        // 1. Position Extrapolation
+        if (age > 0.0f && age < failureTimeout) {
             currentPos += (currentSpeed * age);
         }
 
-        // Write results to output buffers
+        // Write results
         outPos[i] = currentPos;
         outSpeed[i] = currentSpeed;
-        outBrake[i] = 0; // Default: No brake
+        outBrake[i] = 0;
 
-        // 2. Ghost Detection (Check for timeouts)
+        // 2. Ghost Detection
         if (age > signalTimeout) {
-            double relativePos = currentPos - myPos;
+            float relativePos = currentPos - myPos;
 
-            // Only panic if the ghost is AHEAD of us
-            if (relativePos > 0) {
-                outSpeed[i] = 0.0;    // Assume stopped
-                outBrake[i] = 1;      // Flag emergency brake
+            if (relativePos > 0.0f) {
+                outSpeed[i] = 0.0f;
+                outBrake[i] = 1;
             }
         }
     }
