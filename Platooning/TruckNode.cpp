@@ -119,9 +119,9 @@ void TruckNode::runInput(){
     while (true) {
         char c;
         std::cin >> c;
-        pthread_mutex_lock(&stateMutex);
         double t_input_start;
         Profiler::recordStart("Input", t_input_start);
+        pthread_mutex_lock(&stateMutex);
         switch(c) {
             case 'b':
                 emergencyBrake = !emergencyBrake;
@@ -139,8 +139,8 @@ void TruckNode::runInput(){
                 logEvent("INPUT", isJamming ? "User toggled Jamming ON" : "User toggled Jamming OFF");
                 break;
         }
-        Profiler::recordEnd("Input", t_input_start);
         pthread_mutex_unlock(&stateMutex);
+        Profiler::recordEnd("Input", t_input_start);
     }
 }
 
