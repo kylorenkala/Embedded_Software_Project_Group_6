@@ -6,6 +6,8 @@
 #include <vector>
 #include <omp.h>
 #include <sstream>
+#include <profiler.h>
+
 
 // Constants
 const double FAILURE_TIMEOUT = 10.0;
@@ -63,20 +65,22 @@ void TruckNode::logEvent(std::string type, std::string desc) {
 // --- THREAD 1: COMMUNICATION ---
 void TruckNode::runCommunication() {
     while (true) {
+        //pycpa
+        double t_comms_start;
+        Profiler::recordStart("Comms", t_comms_start);
+
         while (true) {
             PlatoonMessage msg{};
-            if (!net->receive(msg)) break;
+            if (!net->receive(msg)) break; // receive
 
             pthread_mutex_lock(&stateMutex);
-            neighbors[msg.truckId] = msg;
+            neighbors[msg.truckId] = msg; // populate with neighbours' messages
             neighbors[msg.truckId].timestamp = time(nullptr);
-
-            // Record precise reception time
             receptionTimes[msg.truckId] = std::chrono::steady_clock::now();
 
             for(int i=0; i<MAX_NODES; i++) {
                 for(int j=0; j<MAX_NODES; j++) {
-                    myMatrix[i][j] = std::max(myMatrix[i][j], msg.matrixClock[i][j]);
+                    myMatrix[i][j] = std::max(myMatrix[i][j], msg.matrixClock[i][j]); // update matrix clock with data from trucks
                 }
             }
             if(id < MAX_NODES && msg.truckId < MAX_NODES) {
@@ -85,6 +89,7 @@ void TruckNode::runCommunication() {
             pthread_mutex_unlock(&stateMutex);
         }
 
+        // prepare message for send
         pthread_mutex_lock(&stateMutex);
         bool jamming = isJamming;
         PlatoonMessage myMsg{};
@@ -103,8 +108,9 @@ void TruckNode::runCommunication() {
         pthread_mutex_unlock(&stateMutex);
 
         if (!jamming) {
-            net->broadcast(myMsg);
+            net->broadcast(myMsg); // blast
         }
+        Profiler::recordEnd("Comms", t_comms_start);
         usleep(50000);
     }
 }
@@ -115,6 +121,8 @@ void TruckNode::runInput(){
     while (true) {
         char c;
         std::cin >> c;
+        double t_input_start;
+        Profiler::recordStart("Input", t_input_start);
         pthread_mutex_lock(&stateMutex);
         switch(c) {
             case 'b':
@@ -134,6 +142,7 @@ void TruckNode::runInput(){
                 break;
         }
         pthread_mutex_unlock(&stateMutex);
+        Profiler::recordEnd("Input", t_input_start);
     }
 }
 
@@ -144,6 +153,9 @@ void TruckNode::runLogic() {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
     while (true) {
+        double t_logic_start;
+        Profiler::recordStart("Logic", t_logic_start);
+
         auto now = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = now - lastTime;
         double dt = elapsed.count();
@@ -302,6 +314,8 @@ void TruckNode::runLogic() {
         logMatrix();
 
         pthread_mutex_unlock(&stateMutex);
+
+        Profiler::recordEnd("Logic", t_logic_start);
         usleep(50000);
     }
 }

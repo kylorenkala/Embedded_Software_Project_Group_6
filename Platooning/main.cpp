@@ -1,12 +1,25 @@
 #include <iostream>
 #include <pthread.h>
 #include "TruckNode.h"
+#include <csignal>
+#include "profiler.h"
+
+int truckIdGlobal; 
+
+void onShutdown(int sig) {
+    Profiler::dumpResults(truckIdGlobal);
+    exit(0);
+}
 
 int main() {
+    signal(SIGINT, onShutdown);
+
     int id;
     std::cout << "--- COMPONENT-BASED TRUCK ---\n";
     std::cout << "Enter Truck ID: ";
     std::cin >> id;
+    
+    truckIdGlobal = id;
 
     TruckNode truck(id);
 
