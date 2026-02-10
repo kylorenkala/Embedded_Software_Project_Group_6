@@ -5,7 +5,7 @@
 #include <cstring>
 #include "common.h"
 
-#ifdef _WIN32
+#ifdef _WIN32 // detect if running windows
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #pragma comment(lib, "ws2_32.lib")
@@ -17,7 +17,7 @@
         }
         ~WinsockInitializer() { WSACleanup(); }
     };
-#else
+#else // default to linux (ubuntu)
     #include <arpa/inet.h>
     #include <unistd.h>
     #include <sys/socket.h>
@@ -28,27 +28,29 @@
 
 class NetworkModule {
 private:
-    int sockfd;
-    sockaddr_in myAddr;
-    sockaddr_in broadcastAddr;
+    int sockfd; // initialize socket integer
+    sockaddr_in myAddr; // initialize local address
+    sockaddr_in broadcastAddr; // initialize broadcaster's address (leader)
     #ifdef _WIN32
     static WinsockInitializer init;
     #endif
 
 public:
     NetworkModule(int id) {
-        sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+        sockfd = socket(AF_INET, SOCK_DGRAM, 0); // init socket
         int broadcast = 1;
         setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, (const char*)&broadcast, sizeof(broadcast));
         int reuse = 1;
-        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse)); // address able to be read by others in platoon
 
+        // local port and address
         memset(&myAddr, 0, sizeof(myAddr));
         myAddr.sin_family = AF_INET;
         myAddr.sin_port = htons(PORT_BASE + id);
         myAddr.sin_addr.s_addr = INADDR_ANY;
-        bind(sockfd, (sockaddr*)&myAddr, sizeof(myAddr));
+        bind(sockfd, (sockaddr*)&myAddr, sizeof(myAddr)); // bind socket to local port and address
 
+        // broadcaster's port and address (leader)
         memset(&broadcastAddr, 0, sizeof(broadcastAddr));
         broadcastAddr.sin_family = AF_INET;
         broadcastAddr.sin_port = htons(PORT_BASE);
@@ -63,27 +65,27 @@ public:
         #endif
     }
 
-    void flush() {
+    void flush() { // clear garbage data
         char dummy[1024];
         sockaddr_in from;
         socklen_t len = sizeof(from);
         while (recvfrom(sockfd, dummy, sizeof(dummy), 0, (sockaddr*)&from, &len) > 0);
     }
 
-    bool receive(PlatoonMessage& msg) {
+    bool receive(PlatoonMessage& msg) { // receive and populate data into msg frame
         sockaddr_in from;
         socklen_t len = sizeof(from);
         return (recvfrom(sockfd, (char*)&msg, sizeof(msg), 0, (sockaddr*)&from, &len) > 0);
     }
 
-    void broadcast(const PlatoonMessage& msg) {
+    void broadcast(const PlatoonMessage& msg) { // broadcast (cycle every truck in platoon)
         for(int i=0; i<MAX_NODES; i++) {
             broadcastAddr.sin_port = htons(PORT_BASE + i);
             if (i != msg.truckId) {
                 sendto(sockfd, (const char*)&msg, sizeof(msg), 0, (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
             }
         }
-        broadcastAddr.sin_port = htons(VISUALIZER_PORT);
+        broadcastAddr.sin_port = htons(VISUALIZER_PORT); // animation data
         sendto(sockfd, (const char*)&msg, sizeof(msg), 0, (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
     }
 

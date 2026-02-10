@@ -1,12 +1,25 @@
 #include <iostream>
 #include <pthread.h>
 #include "TruckNode.h"
+#include <csignal>
+#include "profiler.h"
+
+int truckIdGlobal; 
+
+void onShutdown(int sig) {
+    Profiler::dumpResults(truckIdGlobal);
+    exit(0);
+}
 
 int main() {
+    signal(SIGINT, onShutdown); // detect ctrl c
+
     int id;
     std::cout << "--- COMPONENT-BASED TRUCK ---\n";
     std::cout << "Enter Truck ID: ";
     std::cin >> id;
+    
+    truckIdGlobal = id;
 
     TruckNode truck(id);
 
@@ -18,10 +31,10 @@ int main() {
     }
 
     pthread_t t1, t2;
-    pthread_create(&t1, nullptr, TruckNode::startComms, &truck);
-    pthread_create(&t2, nullptr, TruckNode::startInput, &truck);
+    pthread_create(&t1, nullptr, TruckNode::startComms, &truck); // task 1
+    pthread_create(&t2, nullptr, TruckNode::startInput, &truck); // task 2
 
-    truck.runLogic(); // Main thread runs logic
+    truck.runLogic(); // main thread runs logic, task 3
 
     return 0;
 }

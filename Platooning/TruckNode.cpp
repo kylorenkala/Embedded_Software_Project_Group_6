@@ -6,6 +6,8 @@
 #include <vector>
 #include <omp.h>
 #include <sstream>
+#include <profiler.h>
+
 
 // Constants
 const double FAILURE_TIMEOUT = 10.0;
@@ -63,6 +65,10 @@ void TruckNode::logEvent(std::string type, std::string desc) {
 // --- THREAD 1: COMMUNICATION ---
 void TruckNode::runCommunication() {
     while (true) {
+        //pycpa
+        double t_comms_start;
+        Profiler::recordStart("Comms", t_comms_start);
+
         while (true) {
             PlatoonMessage msg{};
             if (!net->receive(msg)) break;
@@ -105,6 +111,7 @@ void TruckNode::runCommunication() {
         if (!jamming) {
             net->broadcast(myMsg);
         }
+        Profiler::recordEnd("Comms", t_comms_start);
         usleep(50000);
     }
 }
@@ -115,6 +122,8 @@ void TruckNode::runInput(){
     while (true) {
         char c;
         std::cin >> c;
+        double t_input_start;
+        Profiler::recordStart("Input", t_input_start);
         pthread_mutex_lock(&stateMutex);
         switch(c) {
             case 'b':
@@ -134,6 +143,7 @@ void TruckNode::runInput(){
                 break;
         }
         pthread_mutex_unlock(&stateMutex);
+        Profiler::recordEnd("Input", t_input_start);
     }
 }
 
@@ -144,6 +154,9 @@ void TruckNode::runLogic() {
     auto lastTime = std::chrono::high_resolution_clock::now();
 
     while (true) {
+        double t_logic_start;
+        Profiler::recordStart("Logic", t_logic_start);
+
         auto now = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = now - lastTime;
         double dt = elapsed.count();
@@ -157,16 +170,15 @@ void TruckNode::runLogic() {
         double currentTargetSpeed = 0.0;
         double gapFront = -1.0;
 
-        if (isJamming) {
-            jammingTimer += dt;
+        if (isJamming) { // jamming logic runs first
+            jammingTimer += dt; // start timer
             if (jammingTimer < 10.0) {
                 // PHASE 1: BLIND CRUISE
                 double blindSpeed = 50.0 / 3.6;
-                physics.update(blindSpeed, dt);
+                physics.update(blindSpeed, dt); // set constant speed
                 currentTargetSpeed = blindSpeed;
                 if (id != 0) std::cout << " [JAMMED] Blind Cruise (" << std::fixed << std::setprecision(1) << jammingTimer << "s)\r";
-            } else {
-                // PHASE 2: EMERGENCY STOP
+            } else { // timer runs out
                 physics.emergencyStop(dt);
                 currentTargetSpeed = 0.0;
                 if (id != 0) std::cout << " [JAMMED] TIMEOUT! Emergency Stop.\r";
@@ -174,8 +186,7 @@ void TruckNode::runLogic() {
                     logEvent("CRITICAL", "Jamming Timeout Exceeded (10s). Initiating Emergency Stop.");
                 }
             }
-        } else {
-            // NORMAL OPERATION
+        } else { // connection restored
             jammingTimer = 0.0;
 
             // =========================================================
@@ -302,6 +313,8 @@ void TruckNode::runLogic() {
         logMatrix();
 
         pthread_mutex_unlock(&stateMutex);
+
+        Profiler::recordEnd("Logic", t_logic_start);
         usleep(50000);
     }
 }
