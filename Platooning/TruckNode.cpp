@@ -165,14 +165,14 @@ void TruckNode::runLogic() {
         double currentTargetSpeed = 0.0;
         double gapFront = -1.0;
 
-        if (isJamming) {
-            jammingTimer += dt;
+        if (isJamming) { // jamming logic runs first
+            jammingTimer += dt; // start timer
             if (jammingTimer < 10.0) {
                 double blindSpeed = 50.0 / 3.6;
-                physics.update(blindSpeed, dt);
+                physics.update(blindSpeed, dt); // set constant speed
                 currentTargetSpeed = blindSpeed;
                 if (id != 0) std::cout << " [JAMMED] Blind Cruise (" << std::fixed << std::setprecision(1) << jammingTimer << "s)\r";
-            } else {
+            } else { // timer runs out
                 physics.emergencyStop(dt);
                 currentTargetSpeed = 0.0;
                 if (id != 0) std::cout << " [JAMMED] TIMEOUT! Emergency Stop.\r";
@@ -180,7 +180,7 @@ void TruckNode::runLogic() {
                     logEvent("CRITICAL", "Jamming Timeout Exceeded (10s). Initiating Emergency Stop.");
                 }
             }
-        } else {
+        } else { // connection restored
             jammingTimer = 0.0;
 
             // --- PREPARE DATA FOR OPENMP ---
