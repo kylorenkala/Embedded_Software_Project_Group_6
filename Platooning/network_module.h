@@ -37,18 +37,20 @@ private:
 
 public:
     NetworkModule(int id) {
-        sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+        sockfd = socket(AF_INET, SOCK_DGRAM, 0); // init socket
         int broadcast = 1;
         setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, (const char*)&broadcast, sizeof(broadcast));
         int reuse = 1;
         setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
 
+        // local address
         memset(&myAddr, 0, sizeof(myAddr));
         myAddr.sin_family = AF_INET;
         myAddr.sin_port = htons(PORT_BASE + id);
         myAddr.sin_addr.s_addr = INADDR_ANY;
-        bind(sockfd, (sockaddr*)&myAddr, sizeof(myAddr));
-
+        bind(sockfd, (sockaddr*)&myAddr, sizeof(myAddr)); // bind socket
+        
+        // save broadcaster's address
         memset(&broadcastAddr, 0, sizeof(broadcastAddr));
         broadcastAddr.sin_family = AF_INET;
         broadcastAddr.sin_port = htons(PORT_BASE);
@@ -63,20 +65,20 @@ public:
         #endif
     }
 
-    void flush() {
+    void flush() { // blank message
         char dummy[1024];
         sockaddr_in from;
         socklen_t len = sizeof(from);
         while (recvfrom(sockfd, dummy, sizeof(dummy), 0, (sockaddr*)&from, &len) > 0);
     }
 
-    bool receive(PlatoonMessage& msg) {
+    bool receive(PlatoonMessage& msg) { // receive message
         sockaddr_in from;
         socklen_t len = sizeof(from);
         return (recvfrom(sockfd, (char*)&msg, sizeof(msg), 0, (sockaddr*)&from, &len) > 0);
     }
 
-    void broadcast(const PlatoonMessage& msg) {
+    void broadcast(const PlatoonMessage& msg) { // blast
         for(int i=0; i<MAX_NODES; i++) {
             broadcastAddr.sin_port = htons(PORT_BASE + i);
             if (i != msg.truckId) {

@@ -67,19 +67,16 @@ void TruckNode::runCommunication() {
 
         while (true) {
             PlatoonMessage msg{};
-            if (!net->receive(msg)) break;
+            if (!net->receive(msg)) break; // receive
 
             pthread_mutex_lock(&stateMutex);
-            neighbors[msg.truckId] = msg;
-            neighbors[msg.truckId].timestamp = time(nullptr); // Keep for legacy compatibility
-
-            // --- FIX: RECORD PRECISE RECEPTION TIME ---
+            neighbors[msg.truckId] = msg; // populate with neighbours' messages
+            neighbors[msg.truckId].timestamp = time(nullptr);
             receptionTimes[msg.truckId] = std::chrono::steady_clock::now();
-            // ------------------------------------------
 
             for(int i=0; i<MAX_NODES; i++) {
                 for(int j=0; j<MAX_NODES; j++) {
-                    myMatrix[i][j] = std::max(myMatrix[i][j], msg.matrixClock[i][j]);
+                    myMatrix[i][j] = std::max(myMatrix[i][j], msg.matrixClock[i][j]); // update matrix clock with data from trucks
                 }
             }
             if(id < MAX_NODES && msg.truckId < MAX_NODES) {
@@ -88,6 +85,7 @@ void TruckNode::runCommunication() {
             pthread_mutex_unlock(&stateMutex);
         }
 
+        // prepare message for send
         pthread_mutex_lock(&stateMutex);
         bool jamming = isJamming;
         PlatoonMessage myMsg{};
@@ -106,7 +104,7 @@ void TruckNode::runCommunication() {
         pthread_mutex_unlock(&stateMutex);
 
         if (!jamming) {
-            net->broadcast(myMsg);
+            net->broadcast(myMsg); // blast
         }
         Profiler::recordEnd("Comms", t_comms_start);
         usleep(50000);
