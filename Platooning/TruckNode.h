@@ -1,6 +1,7 @@
 #ifndef TRUCK_NODE_H
 #define TRUCK_NODE_H
 
+#include "GpuHandler.h"
 #include <memory>
 #include <pthread.h>
 #include <chrono>
@@ -29,6 +30,7 @@ private:
     std::unique_ptr<NetworkModule> net;
     VehiclePhysics physics;
     PlatoonController controller;
+    std::unique_ptr<GpuHandler> gpu;
 
     // State Flags
     bool emergencyBrake = false;
