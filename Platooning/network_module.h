@@ -5,7 +5,7 @@
 #include <cstring>
 #include "common.h"
 
-#ifdef _WIN32
+#ifdef _WIN32 // detect windows machine
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #pragma comment(lib, "ws2_32.lib")
@@ -17,7 +17,7 @@
         }
         ~WinsockInitializer() { WSACleanup(); }
     };
-#else
+#else // default to linux (ubuntu)
     #include <arpa/inet.h>
     #include <unistd.h>
     #include <sys/socket.h>
@@ -37,18 +37,20 @@ private:
 
 public:
     NetworkModule(int id) {
-        sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+        sockfd = socket(AF_INET, SOCK_DGRAM, 0); // initialize socket
         int broadcast = 1;
         setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, (const char*)&broadcast, sizeof(broadcast));
         int reuse = 1;
         setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
 
+        // local address
         memset(&myAddr, 0, sizeof(myAddr));
         myAddr.sin_family = AF_INET;
         myAddr.sin_port = htons(PORT_BASE + id);
         myAddr.sin_addr.s_addr = INADDR_ANY;
         bind(sockfd, (sockaddr*)&myAddr, sizeof(myAddr));
 
+        // broadcaster's address (leader)
         memset(&broadcastAddr, 0, sizeof(broadcastAddr));
         broadcastAddr.sin_family = AF_INET;
         broadcastAddr.sin_port = htons(PORT_BASE);
@@ -70,20 +72,20 @@ public:
         while (recvfrom(sockfd, dummy, sizeof(dummy), 0, (sockaddr*)&from, &len) > 0);
     }
 
-    bool receive(PlatoonMessage& msg) {
+    bool receive(PlatoonMessage& msg) { // receive data and populate msg frame with it
         sockaddr_in from;
         socklen_t len = sizeof(from);
         return (recvfrom(sockfd, (char*)&msg, sizeof(msg), 0, (sockaddr*)&from, &len) > 0);
     }
 
-    void broadcast(const PlatoonMessage& msg) {
+    void broadcast(const PlatoonMessage& msg) { // cycle through followers and send each a message (broadcast)
         for(int i=0; i<MAX_NODES; i++) {
             broadcastAddr.sin_port = htons(PORT_BASE + i);
             if (i != msg.truckId) {
                 sendto(sockfd, (const char*)&msg, sizeof(msg), 0, (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
             }
         }
-        broadcastAddr.sin_port = htons(VISUALIZER_PORT);
+        broadcastAddr.sin_port = htons(VISUALIZER_PORT); // for animation
         sendto(sockfd, (const char*)&msg, sizeof(msg), 0, (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
     }
 
